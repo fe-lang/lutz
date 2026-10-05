@@ -20,11 +20,11 @@ lutz = { path = "../lutz/ingots/lutz" }
 
 ```fe
 use core::Option
-use std::native::ByteBuffer
+use core::ptr::MemSpan
 
 /// `server.port` of a TOML document, or 0.
-fn port(_ source: ByteBuffer) -> i64 {
-    let doc = lutz::parse(source, 0, source.len())
+fn port(_ source: MemSpan) -> i64 {
+    let doc = lutz::parse(source, 0, source.len().downcast_unchecked())
     let mut port: i64 = 0
     if doc.ok() {
         let node = entry(doc, entry(doc, doc.root(), "server"), "port")
@@ -45,6 +45,11 @@ fn entry<K: lutz::Key>(_ doc: lutz::Document, _ table: u64, _ key: K) -> u64 {
 }
 ```
 
+`parse` takes any `lutz::Source`: a `core::ptr::MemSpan` on any backend, or a
+native `std::native::ByteBuffer`. Functions that produce text (`push_error`,
+`push_key`, `push_string`, `push_integer`) append to any `lutz::Sink`: a
+`core::ptr::MemBuffer` or a `ByteBuffer`.
+
 A document is a tree of nodes addressed by `u64` handles; `lutz::NONE` marks
 a missing node. Tables and arrays keep their entries in source order.
 
@@ -55,7 +60,7 @@ a missing node. Tables and arrays keep their entries in source order.
 | `get(table, "key")`, `len(node)`, `first(node)`, `next(node)`, `at(array, i)` | navigation |
 | `key(node)`, `value(node)`, `byte_at(i)`, `push_key`, `push_string` | decoded keys and strings; floats and date-times as normalized text |
 | `integer(node)`, `push_integer`, `boolean(node)` | numbers and booleans |
-| `release()` | frees the document |
+| `release()` | frees the document (a no-op on the EVM, whose memory isn't reclaimed) |
 
 Keys and strings are decoded (escapes, line ending backslashes, CRLF to LF).
 Integers are checked to fit 64 bits. Dates and times are validated, including
@@ -63,8 +68,8 @@ leap years. Tables follow the definition rules of Python's `tomllib`.
 
 ## Design
 
-The whole document lives in one allocation, divided into regions sized from
-the source length: the source, the decoded text, the nodes, and the stacks of
+The whole document lives in one allocation of linear memory
+(`core::ptr::MemBuffer`), divided into regions sized from the source length: the source, the decoded text, the nodes, and the stacks of
 key segments and open containers. Arrays and inline tables are parsed with an
 explicit stack instead of recursion, so nesting depth is limited by memory
 only. Both choices also keep Fe's borrow checking of the parser fast.
@@ -72,7 +77,7 @@ only. Both choices also keep Fe's borrow checking of the parser fast.
 ## Testing
 
 ```sh
-make test FE=/path/to/fe                                  # Fe unit tests
+make test FE=/path/to/fe                                  # Fe unit tests, EVM and native
 make test FE=/path/to/fe TOML_TEST=/path/to/toml-test     # plus the toml-test suite
 ```
 

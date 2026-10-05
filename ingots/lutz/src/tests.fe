@@ -1,14 +1,12 @@
 use core::Option
 use ingot::document::{Document, Error, Key, NONE, push_lit}
 use ingot::parser::parse
-use std::native::ByteBuffer
+use core::ptr::{MemBuffer, MemSpan}
 
 fn parse_text<T: Key>(_ text: T) -> Document {
-    let mut source = ByteBuffer::new()
+    let mut source = MemBuffer::empty()
     push_lit(mut source, text)
-    let doc = parse(source, 0, source.len())
-    source.release()
-    doc
+    parse(source.span(), 0, source.len().downcast_unchecked())
 }
 
 fn node<T: Key>(_ doc: Document, _ table: u64, _ key: T) -> u64 {
@@ -82,18 +80,18 @@ fn errors_have_positions() {
         Option::Some(Error::DuplicateKey) => {}
         _ => core::assert(false)
     }
-    let mut message = ByteBuffer::new()
+    let mut message = MemBuffer::empty()
     doc.push_error(mut message)
     // "line 2, column 1: duplicate key"
-    core::assert(message.len() == 31 && message.byte_at(5) == 50 && message.byte_at(15) == 49)
-    message.release()
+    let text = message.span()
+    core::assert(text.len() == 31 && text.byte_at(5) == 50 && text.byte_at(15) == 49)
     doc.release()
 }
 
 // The example from the README.
 
-fn port(_ source: ByteBuffer) -> i64 {
-    let doc = parse(source, 0, source.len())
+fn port(_ source: MemSpan) -> i64 {
+    let doc = parse(source, 0, source.len().downcast_unchecked())
     let mut port: i64 = 0
     if doc.ok() {
         let node = entry(doc, entry(doc, doc.root(), "server"), "port")
@@ -114,11 +112,10 @@ fn entry<K: Key>(_ doc: Document, _ table: u64, _ key: K) -> u64 {
 
 #[test]
 fn readme_example() {
-    let mut source = ByteBuffer::new()
+    let mut source = MemBuffer::empty()
     push_lit(mut source, "[server]\nport = 8080\n")
-    core::assert(port(source) == 8080)
-    source.clear()
-    push_lit(mut source, "[server]\nport = \"x\"\n")
-    core::assert(port(source) == 0)
-    source.release()
+    core::assert(port(source.span()) == 8080)
+    let mut other = MemBuffer::empty()
+    push_lit(mut other, "[server]\nport = \"x\"\n")
+    core::assert(port(other.span()) == 0)
 }

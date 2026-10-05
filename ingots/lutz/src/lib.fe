@@ -7,5 +7,5 @@
 //! The document is a tree of nodes addressed by `u64` handles (`NONE` when
 //! absent). Tables and arrays keep their entries in source order.
 
-pub use document::{Document, Error, Key, Kind, NONE, Span}
+pub use document::{Document, Error, Key, Kind, NONE, Sink, Source, Span}
 pub use parser::parse

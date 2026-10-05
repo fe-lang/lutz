@@ -4,9 +4,8 @@ use core::Option
 use ingot::document::{
     ARRAY, ARRAY_OF_TABLES, BOOLEAN, DOTTED_SECTION, Document, EXPLICIT, Error, FLOAT, FROZEN,
     INTEGER, KIND, LOCAL_DATE, LOCAL_DATE_TIME, LOCAL_TIME, NEGATIVE, NONE, NUMBER,
-    OFFSET_DATE_TIME, STRING, Span, TABLE, VALUE_LEN, VALUE_START,
+    OFFSET_DATE_TIME, STRING, Source, Span, TABLE, VALUE_LEN, VALUE_START,
 }
-use std::native::ByteBuffer
 
 /// Returned by `peek` at the end of the source.
 const EOF: u64 = 256
@@ -24,12 +23,13 @@ const FRAME_AT: u64 = 4
 const FRAME_ARRAY: u64 = 0
 const FRAME_INLINE_TABLE: u64 = 1
 
-/// Parse `len` bytes of `source`, starting at `start`. Check `ok()` on the result.
-pub fn parse(_ source: ByteBuffer, _ start: u64, _ len: u64) -> Document {
+/// Parse `len` bytes of `source` (a `MemSpan`, a native `ByteBuffer`, or any
+/// other `Source`), starting at `start`. Check `ok()` on the result.
+pub fn parse<S: Source>(_ source: S, _ start: u64, _ len: u64) -> Document {
     let mut doc = Document::new(len)
     let mut i: u64 = 0
     while i < len {
-        doc.mem.set_byte(index: i, value: source.byte_at(start + i))
+        doc.store(i, source.source_byte(start + i))
         i += 1
     }
     doc.parse_document()
@@ -51,7 +51,7 @@ impl Document {
 
     fn peek_at(self, _ offset: u64) -> u64 {
         if self.pos + offset < self.source_len {
-            self.mem.byte_at(self.pos + offset) as u64
+            self.byte(self.pos + offset) as u64
         } else {
             EOF
         }
@@ -108,7 +108,7 @@ impl Document {
 
     /// The length of the valid UTF-8 sequence at `at`, or 0.
     fn utf8_length(self, _ at: u64) -> u64 {
-        let b = self.mem.byte_at(at)
+        let b = self.byte(at)
         if b < 0x80 {
             return 1
         }
@@ -128,10 +128,10 @@ impl Document {
         }
         let mut k: u64 = 1
         while k <= extra {
-            if at + k >= self.source_len || self.mem.byte_at(at + k) & 0xc0 != 0x80 {
+            if at + k >= self.source_len || self.byte(at + k) & 0xc0 != 0x80 {
                 return 0
             }
-            code = (code << 6) | (self.mem.byte_at(at + k) & 0x3f) as u64
+            code = (code << 6) | (self.byte(at + k) & 0x3f) as u64
             k += 1
         }
         if code < min || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
@@ -877,7 +877,7 @@ impl Document {
             self.pos += 1
         }
         // A date followed by a space and a time is a single date-time.
-        if self.pos - start == 10 && self.mem.byte_at(start + 4) == 45 && self.peek() == 32
+        if self.pos - start == 10 && self.byte(start + 4) == 45 && self.peek() == 32
             && is_digit(self.peek_at(1))
         {
             self.pos += 1
@@ -886,10 +886,10 @@ impl Document {
             }
         }
         let token = Span { start, len: self.pos - start }
-        if token.len >= 5 && self.mem.byte_at(start + 4) == 45 && is_digit(self.mem.byte_at(start) as u64) {
+        if token.len >= 5 && self.byte(start + 4) == 45 && is_digit(self.byte(start) as u64) {
             return self.parse_date_time(token)
         }
-        if token.len >= 3 && self.mem.byte_at(start + 2) == 58 {
+        if token.len >= 3 && self.byte(start + 2) == 58 {
             return self.parse_local_time(token)
         }
         self.parse_number(token)
@@ -897,7 +897,7 @@ impl Document {
 
     fn token_byte(self, _ token: Span, _ index: u64) -> u64 {
         if index < token.len {
-            self.mem.byte_at(token.start + index) as u64
+            self.byte(token.start + index) as u64
         } else {
             EOF
         }

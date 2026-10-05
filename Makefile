@@ -7,7 +7,8 @@ out/decoder: $(SOURCES)
 
 .PHONY: test
 test: out/decoder
-	$(FE) test --backend native .
+	$(FE) test --ingot lutz .
+	$(FE) test --backend native --ingot lutz .
 	# Needs a checkout of https://github.com/toml-lang/toml-test in TOML_TEST.
 	if [ -n "$(TOML_TEST)" ]; then python3 tests/toml_test.py $(TOML_TEST); fi
 
