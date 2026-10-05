@@ -80,3 +80,7 @@ The repository is a Fe workspace: the library is `ingots/lutz`, and
 `tools/decoder` is the toml-test decoder: TOML on stdin, tagged JSON on
 stdout. `tests/toml_test.py` runs it on the suite with the comparison rules of
 toml-test's runner (Go isn't needed).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](./LICENSE-APACHE).
