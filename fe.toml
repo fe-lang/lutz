@@ -1,0 +1,7 @@
+[workspace]
+name = "lutz"
+version = "0.1.0"
+members = [
+  { path = "ingots/lutz", name = "lutz" },
+  { path = "tools/decoder", name = "decoder" },
+]

@@ -1,0 +1,560 @@
+use core::Option
+use std::native::ByteBuffer
+
+/// Marks the absence of a node.
+pub const NONE: u64 = 0xffffffffffffffff
+
+/// The type of a node.
+pub enum Kind {
+    Table,
+    Array,
+    String,
+    Integer,
+    Float,
+    Boolean,
+    /// A date and time with an offset, such as `1979-05-27T07:32:00Z`.
+    OffsetDateTime,
+    /// A date and time without an offset.
+    LocalDateTime,
+    LocalDate,
+    LocalTime,
+}
+
+impl Copy for Kind {}
+
+// Node kinds as stored in the KIND column.
+pub(ingot) const TABLE: u64 = 0
+pub(ingot) const ARRAY: u64 = 1
+pub(ingot) const STRING: u64 = 2
+pub(ingot) const INTEGER: u64 = 3
+pub(ingot) const FLOAT: u64 = 4
+pub(ingot) const BOOLEAN: u64 = 5
+pub(ingot) const OFFSET_DATE_TIME: u64 = 6
+pub(ingot) const LOCAL_DATE_TIME: u64 = 7
+pub(ingot) const LOCAL_DATE: u64 = 8
+pub(ingot) const LOCAL_TIME: u64 = 9
+
+// Node columns.
+pub(ingot) const KIND: u64 = 0
+pub(ingot) const PARENT: u64 = 1
+pub(ingot) const FIRST_CHILD: u64 = 2
+pub(ingot) const LAST_CHILD: u64 = 3
+pub(ingot) const NEXT_SIBLING: u64 = 4
+pub(ingot) const CHILD_COUNT: u64 = 5
+pub(ingot) const KEY_START: u64 = 6
+pub(ingot) const KEY_LEN: u64 = 7
+/// Strings: the decoded bytes. Floats and date-times: their normalized text.
+pub(ingot) const VALUE_START: u64 = 8
+pub(ingot) const VALUE_LEN: u64 = 9
+/// Integers: the magnitude. Booleans: 0 or 1.
+pub(ingot) const NUMBER: u64 = 10
+pub(ingot) const FLAGS: u64 = 11
+/// The section in which dotted keys created or extended this table, or 0.
+pub(ingot) const DOTTED_SECTION: u64 = 12
+pub(ingot) const COLUMNS: u64 = 13
+
+// Node flags.
+pub(ingot) const NEGATIVE: u64 = 1
+/// A table defined by a `[table]` header (or an array of tables element).
+pub(ingot) const EXPLICIT: u64 = 2
+/// An array created by `[[array]]` headers.
+pub(ingot) const ARRAY_OF_TABLES: u64 = 4
+/// An inline table or array literal, or a value inside one: it can't be extended.
+pub(ingot) const FROZEN: u64 = 8
+
+/// Why parsing failed.
+pub enum Error {
+    InvalidUtf8,
+    UnexpectedEnd,
+    UnexpectedCharacter,
+    ControlCharacter,
+    ExpectedNewline,
+    ExpectedEquals,
+    ExpectedValue,
+    InvalidKey,
+    InvalidEscape,
+    InvalidNumber,
+    IntegerOutOfRange,
+    InvalidDateTime,
+    DuplicateKey,
+    TableRedefined,
+    NotATable,
+    Immutable,
+}
+
+impl Copy for Error {}
+
+/// Keys given as string literals, such as `doc.get(table, "name")`.
+pub trait Key {
+    const SIZE: usize
+    fn bytes(self) -> [u8; Self::SIZE]
+}
+
+impl<const LEN: usize> Key for String<LEN> {
+    const SIZE: usize = LEN
+    fn bytes(self) -> [u8; Self::SIZE] {
+        self.as_bytes()
+    }
+}
+
+/// A byte range of the document's text.
+pub struct Span {
+    pub start: u64,
+    pub len: u64,
+}
+
+impl Copy for Span {}
+
+/// A parsed TOML document.
+///
+/// Nodes are addressed by `u64` handles; `NONE` marks a missing node. The
+/// root node is a table. Keys and string values are decoded; their bytes are
+/// read with `byte_at` or appended to another buffer with `push_key` and
+/// `push_string`.
+///
+/// Everything lives in one allocation, divided into regions sized from the
+/// source length: the source, the decoded text, the nodes, and the stacks of
+/// key segments and open containers used while parsing. (Writes into several
+/// separate buffers make Fe's borrow checking of the parser slower than this.)
+pub struct Document {
+    pub(ingot) mem: ByteBuffer,
+    pub(ingot) source_len: u64,
+    pub(ingot) text_base: u64,
+    pub(ingot) text_len: u64,
+    pub(ingot) nodes_base: u64,
+    pub(ingot) node_count: u64,
+    pub(ingot) keys_base: u64,
+    pub(ingot) key_count: u64,
+    pub(ingot) frames_base: u64,
+    pub(ingot) frame_count: u64,
+    /// Rows available in each of the node, key and frame regions.
+    pub(ingot) capacity: u64,
+    pub(ingot) pos: u64,
+    pub(ingot) error: Option<Error>,
+    pub(ingot) error_pos: u64,
+    pub(ingot) section: u64,
+}
+
+/// Bytes per row of the key region (start, len) and the frame region.
+pub(ingot) const KEY_COLUMNS: u64 = 2
+pub(ingot) const FRAME_COLUMNS: u64 = 5
+
+impl Document {
+    /// An empty document for `source_len` bytes of source. Decoding never
+    /// makes text longer, and every node, key segment and open container
+    /// needs at least one source byte, so the regions can't overflow.
+    pub(ingot) fn new(_ source_len: u64) -> Self {
+        let capacity = source_len + 2
+        let text_base = source_len
+        let nodes_base = text_base + source_len
+        let keys_base = nodes_base + capacity * COLUMNS * 8
+        let frames_base = keys_base + capacity * KEY_COLUMNS * 8
+        let mut mem = ByteBuffer::new()
+        core::assert(mem.try_resize(frames_base + capacity * FRAME_COLUMNS * 8))
+        let mut doc = Self {
+            mem,
+            source_len,
+            text_base,
+            text_len: 0,
+            nodes_base,
+            node_count: 0,
+            keys_base,
+            key_count: 0,
+            frames_base,
+            frame_count: 0,
+            capacity,
+            pos: 0,
+            error: Option::None,
+            error_pos: 0,
+            section: 1,
+        }
+        doc.new_node(TABLE)
+        doc
+    }
+
+    pub fn release(own self) {
+        self.mem.release()
+    }
+
+    /// Whether the document was parsed without error.
+    pub fn ok(self) -> bool {
+        match self.error {
+            Option::Some(_) => false
+            Option::None => true
+        }
+    }
+
+    /// The parse error, if any.
+    pub fn error(self) -> Option<Error> {
+        // `Option` isn't `Copy` yet (see fe branch fix/option-copy).
+        match self.error {
+            Option::Some(error) => Option::Some(error)
+            Option::None => Option::None
+        }
+    }
+
+    /// Byte offset of the parse error in the source.
+    pub fn error_offset(self) -> u64 {
+        self.error_pos
+    }
+
+    /// Append `line <l>, column <c>: <description>` for the parse error.
+    pub fn push_error(self, _ out: mut ByteBuffer) {
+        let mut line: u64 = 1
+        let mut column: u64 = 1
+        let mut i: u64 = 0
+        while i < self.error_pos && i < self.source_len {
+            if self.mem.byte_at(i) == 10 {
+                line += 1
+                column = 1
+            } else if self.mem.byte_at(i) & 0xc0 != 0x80 {
+                column += 1
+            }
+            i += 1
+        }
+        push_lit(mut out, "line ")
+        push_decimal(mut out, line)
+        push_lit(mut out, ", column ")
+        push_decimal(mut out, column)
+        push_lit(mut out, ": ")
+        match self.error {
+            Option::Some(error) => push_error_text(mut out, error)
+            Option::None => push_lit(mut out, "no error")
+        }
+    }
+
+    pub fn root(self) -> u64 {
+        0
+    }
+
+    pub fn kind(self, _ node: u64) -> Kind {
+        let kind = self.node_get(node, KIND)
+        if kind == TABLE {
+            Kind::Table
+        } else if kind == ARRAY {
+            Kind::Array
+        } else if kind == STRING {
+            Kind::String
+        } else if kind == INTEGER {
+            Kind::Integer
+        } else if kind == FLOAT {
+            Kind::Float
+        } else if kind == BOOLEAN {
+            Kind::Boolean
+        } else if kind == OFFSET_DATE_TIME {
+            Kind::OffsetDateTime
+        } else if kind == LOCAL_DATE_TIME {
+            Kind::LocalDateTime
+        } else if kind == LOCAL_DATE {
+            Kind::LocalDate
+        } else {
+            Kind::LocalTime
+        }
+    }
+
+    pub fn is_table(self, _ node: u64) -> bool {
+        self.node_get(node, KIND) == TABLE
+    }
+
+    pub fn is_array(self, _ node: u64) -> bool {
+        self.node_get(node, KIND) == ARRAY
+    }
+
+    pub fn is_string(self, _ node: u64) -> bool {
+        self.node_get(node, KIND) == STRING
+    }
+
+    pub fn is_integer(self, _ node: u64) -> bool {
+        self.node_get(node, KIND) == INTEGER
+    }
+
+    pub fn is_boolean(self, _ node: u64) -> bool {
+        self.node_get(node, KIND) == BOOLEAN
+    }
+
+    /// Number of entries of a table or elements of an array.
+    pub fn len(self, _ node: u64) -> u64 {
+        self.node_get(node, CHILD_COUNT)
+    }
+
+    /// The first entry or element of a table or array, or `NONE`.
+    pub fn first(self, _ node: u64) -> u64 {
+        self.node_get(node, FIRST_CHILD)
+    }
+
+    /// The entry or element after `node`, or `NONE`.
+    pub fn next(self, _ node: u64) -> u64 {
+        self.node_get(node, NEXT_SIBLING)
+    }
+
+    /// The array element at `index`, or `NONE`.
+    pub fn at(self, _ array: u64, _ index: u64) -> u64 {
+        let mut node = self.first(array)
+        let mut i: u64 = 0
+        while i < index && node != NONE {
+            node = self.next(node)
+            i += 1
+        }
+        node
+    }
+
+    /// The value of `key` in `table`, if `table` is a table that has it.
+    pub fn get<T: Key>(self, _ table: u64, _ key: T) -> Option<u64> {
+        if table == NONE || !self.is_table(table) {
+            return Option::None
+        }
+        let bytes = key.bytes()
+        let mut node = self.first(table)
+        while node != NONE {
+            let name = self.key(node)
+            if name.len as usize == T::SIZE {
+                let mut same = true
+                let mut i: u64 = 0
+                while same && i < name.len {
+                    same = self.mem.byte_at(name.start + i) == bytes[i as usize]
+                    i += 1
+                }
+                if same {
+                    return Option::Some(node)
+                }
+            }
+            node = self.next(node)
+        }
+        Option::None
+    }
+
+    /// The key of a table entry (empty for array elements).
+    pub fn key(self, _ node: u64) -> Span {
+        Span { start: self.node_get(node, KEY_START), len: self.node_get(node, KEY_LEN) }
+    }
+
+    /// The decoded bytes of a string, or the text of a float or date-time,
+    /// normalized: no underscores in floats, `inf`/`nan` without `+`, and
+    /// `T`/`Z` in upper case in date-times.
+    pub fn value(self, _ node: u64) -> Span {
+        Span { start: self.node_get(node, VALUE_START), len: self.node_get(node, VALUE_LEN) }
+    }
+
+    pub fn byte_at(self, _ index: u64) -> u8 {
+        self.mem.byte_at(index)
+    }
+
+    /// Append the key of `node` to `out`.
+    pub fn push_key(self, _ node: u64, _ out: mut ByteBuffer) {
+        self.push_span(self.key(node), mut out)
+    }
+
+    /// Append the value text of `node` (see `value`) to `out`.
+    pub fn push_string(self, _ node: u64, _ out: mut ByteBuffer) {
+        self.push_span(self.value(node), mut out)
+    }
+
+    fn push_span(self, _ span: Span, _ out: mut ByteBuffer) {
+        let mut i: u64 = 0
+        while i < span.len {
+            push(mut out, self.mem.byte_at(span.start + i))
+            i += 1
+        }
+    }
+
+    pub fn boolean(self, _ node: u64) -> bool {
+        self.node_get(node, NUMBER) == 1
+    }
+
+    pub fn integer(self, _ node: u64) -> i64 {
+        let magnitude = self.node_get(node, NUMBER)
+        if self.node_get(node, FLAGS) & NEGATIVE == 0 {
+            let value: i64 = magnitude.downcast_unchecked()
+            return value
+        }
+        if magnitude == 0x8000000000000000 {
+            return -9223372036854775807 - 1
+        }
+        let value: i64 = magnitude.downcast_unchecked()
+        0 - value
+    }
+
+    /// Append an integer in decimal.
+    pub fn push_integer(self, _ node: u64, _ out: mut ByteBuffer) {
+        if self.node_get(node, FLAGS) & NEGATIVE != 0 {
+            push(mut out, 45)
+        }
+        push_decimal(mut out, self.node_get(node, NUMBER))
+    }
+
+    // Construction, used by the parser.
+
+    pub(ingot) fn new_node(mut self, _ kind: u64) -> u64 {
+        let node = self.node_count
+        core::assert(node < self.capacity)
+        self.node_count += 1
+        self.node_set(node, KIND, kind)
+        self.node_set(node, PARENT, NONE)
+        self.node_set(node, FIRST_CHILD, NONE)
+        self.node_set(node, LAST_CHILD, NONE)
+        self.node_set(node, NEXT_SIBLING, NONE)
+        node
+    }
+
+    pub(ingot) fn node_get(self, _ node: u64, _ column: u64) -> u64 {
+        self.read_word(self.nodes_base + (node * COLUMNS + column) * 8)
+    }
+
+    pub(ingot) fn node_set(mut self, _ node: u64, _ column: u64, _ value: u64) {
+        self.write_word(self.nodes_base + (node * COLUMNS + column) * 8, value)
+    }
+
+    pub(ingot) fn key_get(self, _ index: u64, _ column: u64) -> u64 {
+        self.read_word(self.keys_base + (index * KEY_COLUMNS + column) * 8)
+    }
+
+    pub(ingot) fn push_key_segment(mut self, _ segment: Span) {
+        core::assert(self.key_count < self.capacity)
+        let index = self.key_count
+        self.key_count += 1
+        self.write_word(self.keys_base + index * KEY_COLUMNS * 8, segment.start)
+        self.write_word(self.keys_base + (index * KEY_COLUMNS + 1) * 8, segment.len)
+    }
+
+    pub(ingot) fn frame_get(self, _ frame: u64, _ column: u64) -> u64 {
+        self.read_word(self.frames_base + (frame * FRAME_COLUMNS + column) * 8)
+    }
+
+    pub(ingot) fn frame_set(mut self, _ frame: u64, _ column: u64, _ value: u64) {
+        self.write_word(self.frames_base + (frame * FRAME_COLUMNS + column) * 8, value)
+    }
+
+    /// Append a decoded byte to the text region.
+    pub(ingot) fn push_text(mut self, _ byte: u8) {
+        core::assert(self.text_len < self.source_len)
+        self.mem.set_byte(index: self.text_base + self.text_len, value: byte)
+        self.text_len += 1
+    }
+
+    /// Where the next decoded byte goes.
+    pub(ingot) fn text_end(self) -> u64 {
+        self.text_base + self.text_len
+    }
+
+    fn read_word(self, _ at: u64) -> u64 {
+        let mut value: u64 = 0
+        let mut i: u64 = 8
+        while i > 0 {
+            i -= 1
+            value = (value << 8) | self.mem.byte_at(at + i) as u64
+        }
+        value
+    }
+
+    fn write_word(mut self, _ at: u64, _ value: u64) {
+        let mut i: u64 = 0
+        while i < 8 {
+            self.mem.set_byte(index: at + i, value: ((value >> (i * 8)) & 0xff).downcast_truncate())
+            i += 1
+        }
+    }
+
+    /// Append `node` to the entries of `parent` under `key`.
+    pub(ingot) fn attach(mut self, _ parent: u64, _ node: u64, _ key: Span) {
+        self.node_set(node, PARENT, parent)
+        self.node_set(node, KEY_START, key.start)
+        self.node_set(node, KEY_LEN, key.len)
+        let last = self.node_get(parent, LAST_CHILD)
+        if last == NONE {
+            self.node_set(parent, FIRST_CHILD, node)
+        } else {
+            self.node_set(last, NEXT_SIBLING, node)
+        }
+        self.node_set(parent, LAST_CHILD, node)
+        self.node_set(parent, CHILD_COUNT, self.node_get(parent, CHILD_COUNT) + 1)
+    }
+
+    /// The entry of `table` whose key equals `key` (a span of the text), or `NONE`.
+    pub(ingot) fn find(self, _ table: u64, _ key: Span) -> u64 {
+        let mut node = self.first(table)
+        while node != NONE {
+            let name = self.key(node)
+            if name.len == key.len {
+                let mut same = true
+                let mut i: u64 = 0
+                while same && i < key.len {
+                    same = self.mem.byte_at(name.start + i) == self.mem.byte_at(key.start + i)
+                    i += 1
+                }
+                if same {
+                    return node
+                }
+            }
+            node = self.next(node)
+        }
+        NONE
+    }
+
+    pub(ingot) fn flags(self, _ node: u64) -> u64 {
+        self.node_get(node, FLAGS)
+    }
+
+    pub(ingot) fn add_flags(mut self, _ node: u64, _ flags: u64) {
+        self.node_set(node, FLAGS, self.node_get(node, FLAGS) | flags)
+    }
+
+    /// Mark `node` and everything below it as frozen. Values are parsed
+    /// depth first, so the nodes below `node` are the ones created after it.
+    pub(ingot) fn freeze(mut self, _ node: u64) {
+        let mut i = node
+        while i < self.node_count {
+            self.add_flags(i, FROZEN)
+            i += 1
+        }
+    }
+}
+
+fn push_error_text(_ out: mut ByteBuffer, _ error: Error) {
+    match error {
+        Error::InvalidUtf8 => push_lit(mut out, "invalid UTF-8")
+        Error::UnexpectedEnd => push_lit(mut out, "unexpected end of input")
+        Error::UnexpectedCharacter => push_lit(mut out, "unexpected character")
+        Error::ControlCharacter => push_lit(mut out, "control character")
+        Error::ExpectedNewline => push_lit(mut out, "expected a new line")
+        Error::ExpectedEquals => push_lit(mut out, "expected `=` after a key")
+        Error::ExpectedValue => push_lit(mut out, "expected a value")
+        Error::InvalidKey => push_lit(mut out, "invalid key")
+        Error::InvalidEscape => push_lit(mut out, "invalid escape sequence")
+        Error::InvalidNumber => push_lit(mut out, "invalid number")
+        Error::IntegerOutOfRange => push_lit(mut out, "integer out of range")
+        Error::InvalidDateTime => push_lit(mut out, "invalid date or time")
+        Error::DuplicateKey => push_lit(mut out, "duplicate key")
+        Error::TableRedefined => push_lit(mut out, "table defined twice")
+        Error::NotATable => push_lit(mut out, "key is not a table")
+        Error::Immutable => {
+            push_lit(mut out, "inline tables and arrays ")
+            push_lit(mut out, "can't be extended")
+        }
+    }
+}
+
+pub(ingot) fn push(_ buf: mut ByteBuffer, _ byte: u8) {
+    let len = buf.len()
+    core::assert(buf.try_resize(len + 1))
+    buf.set_byte(index: len, value: byte)
+}
+
+pub(ingot) fn push_lit<T: Key>(_ buf: mut ByteBuffer, _ text: T) {
+    let bytes = text.bytes()
+    let mut i: usize = 0
+    while i < T::SIZE {
+        push(mut buf, bytes[i])
+        i += 1
+    }
+}
+
+pub(ingot) fn push_decimal(_ buf: mut ByteBuffer, _ value: u64) {
+    let mut divisor: u64 = 1
+    while value / divisor >= 10 {
+        divisor *= 10
+    }
+    while divisor > 0 {
+        push(mut buf, (48 + (value / divisor) % 10).downcast_truncate())
+        divisor /= 10
+    }
+}

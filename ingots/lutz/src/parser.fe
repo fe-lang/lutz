@@ -1,0 +1,1217 @@
+//! A TOML 1.0 parser. The rules for defining tables follow Python's `tomllib`.
+
+use core::Option
+use ingot::document::{
+    ARRAY, ARRAY_OF_TABLES, BOOLEAN, DOTTED_SECTION, Document, EXPLICIT, Error, FLOAT, FROZEN,
+    INTEGER, KIND, LOCAL_DATE, LOCAL_DATE_TIME, LOCAL_TIME, NEGATIVE, NONE, NUMBER,
+    OFFSET_DATE_TIME, STRING, Span, TABLE, VALUE_LEN, VALUE_START,
+}
+use std::native::ByteBuffer
+
+/// Returned by `peek` at the end of the source.
+const EOF: u64 = 256
+
+// Columns of the stack of open containers.
+const FRAME_KIND: u64 = 0
+const FRAME_NODE: u64 = 1
+/// Inline tables: where the key of the current entry starts on the key stack.
+const FRAME_KEY_BASE: u64 = 2
+/// Inline tables: the section their dotted keys belong to.
+const FRAME_SECTION: u64 = 3
+/// Where the container (arrays) or current entry (inline tables) starts.
+const FRAME_AT: u64 = 4
+
+const FRAME_ARRAY: u64 = 0
+const FRAME_INLINE_TABLE: u64 = 1
+
+/// Parse `len` bytes of `source`, starting at `start`. Check `ok()` on the result.
+pub fn parse(_ source: ByteBuffer, _ start: u64, _ len: u64) -> Document {
+    let mut doc = Document::new(len)
+    let mut i: u64 = 0
+    while i < len {
+        doc.mem.set_byte(index: i, value: source.byte_at(start + i))
+        i += 1
+    }
+    doc.parse_document()
+    doc
+}
+
+impl Document {
+    fn fail(mut self, _ error: Error, _ at: u64) -> bool {
+        if self.ok() {
+            self.error = Option::Some(error)
+            self.error_pos = at
+        }
+        false
+    }
+
+    fn peek(self) -> u64 {
+        self.peek_at(0)
+    }
+
+    fn peek_at(self, _ offset: u64) -> u64 {
+        if self.pos + offset < self.source_len {
+            self.mem.byte_at(self.pos + offset) as u64
+        } else {
+            EOF
+        }
+    }
+
+    fn allocate_section(mut self) -> u64 {
+        let section = self.section
+        self.section += 1
+        section
+    }
+
+    fn parse_document(mut self) {
+        if !self.check_utf8() {
+            return
+        }
+        let mut table: u64 = self.root()
+        let mut section = self.allocate_section()
+        while true {
+            self.skip_ws()
+            let c = self.peek()
+            if c == EOF {
+                return
+            }
+            if c == 91 {
+                // '['
+                section = self.allocate_section()
+                table = self.parse_header()
+                if table == NONE {
+                    return
+                }
+            } else if c != 35 && c != 10 && c != 13 {
+                if !self.parse_key_value(table, section) {
+                    return
+                }
+            }
+            if !self.end_line() {
+                return
+            }
+        }
+    }
+
+    /// Validate the source as UTF-8 without overlong forms or surrogates.
+    fn check_utf8(mut self) -> bool {
+        let mut i: u64 = 0
+        while i < self.source_len {
+            let length = self.utf8_length(i)
+            if length == 0 {
+                return self.fail(Error::InvalidUtf8, i)
+            }
+            i += length
+        }
+        true
+    }
+
+    /// The length of the valid UTF-8 sequence at `at`, or 0.
+    fn utf8_length(self, _ at: u64) -> u64 {
+        let b = self.mem.byte_at(at)
+        if b < 0x80 {
+            return 1
+        }
+        let mut extra: u64 = 3
+        let mut min: u64 = 0x10000
+        let mut code: u64 = (b & 0x07) as u64
+        if b & 0xe0 == 0xc0 {
+            extra = 1
+            min = 0x80
+            code = (b & 0x1f) as u64
+        } else if b & 0xf0 == 0xe0 {
+            extra = 2
+            min = 0x800
+            code = (b & 0x0f) as u64
+        } else if b & 0xf8 != 0xf0 {
+            return 0
+        }
+        let mut k: u64 = 1
+        while k <= extra {
+            if at + k >= self.source_len || self.mem.byte_at(at + k) & 0xc0 != 0x80 {
+                return 0
+            }
+            code = (code << 6) | (self.mem.byte_at(at + k) & 0x3f) as u64
+            k += 1
+        }
+        if code < min || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
+            return 0
+        }
+        extra + 1
+    }
+
+    fn skip_ws(mut self) {
+        while self.peek() == 32 || self.peek() == 9 {
+            self.pos += 1
+        }
+    }
+
+    /// Skip whitespace, comments and new lines (inside arrays).
+    fn skip_ws_comments_newlines(mut self) -> bool {
+        while true {
+            self.skip_ws()
+            let c = self.peek()
+            if c == 35 {
+                if !self.skip_comment() {
+                    return false
+                }
+            } else if c == 10 {
+                self.pos += 1
+            } else if c == 13 && self.peek_at(1) == 10 {
+                self.pos += 2
+            } else {
+                return true
+            }
+        }
+        true
+    }
+
+    fn skip_comment(mut self) -> bool {
+        self.pos += 1
+        while true {
+            let c = self.peek()
+            if c == EOF || c == 10 || (c == 13 && self.peek_at(1) == 10) {
+                return true
+            }
+            if is_control(c) {
+                return self.fail(Error::ControlCharacter, self.pos)
+            }
+            self.pos += 1
+        }
+        true
+    }
+
+    /// After a header or key/value pair: optional whitespace and comment, then
+    /// a new line or the end.
+    fn end_line(mut self) -> bool {
+        self.skip_ws()
+        if self.peek() == 35 && !self.skip_comment() {
+            return false
+        }
+        let c = self.peek()
+        if c == EOF {
+            return true
+        }
+        if c == 10 {
+            self.pos += 1
+            return true
+        }
+        if c == 13 && self.peek_at(1) == 10 {
+            self.pos += 2
+            return true
+        }
+        if is_control(c) {
+            return self.fail(Error::ControlCharacter, self.pos)
+        }
+        self.fail(Error::ExpectedNewline, self.pos)
+    }
+
+    // Keys and tables.
+
+    /// Parse a possibly dotted key, pushing its segments onto the key stack.
+    fn parse_key(mut self) -> bool {
+        while true {
+            let at = self.pos
+            let c = self.peek()
+            let mut segment = Span { start: 0, len: 0 }
+            if c == 34 {
+                if self.peek_at(1) == 34 && self.peek_at(2) == 34 {
+                    return self.fail(Error::InvalidKey, at)
+                }
+                segment = self.parse_basic_string()
+            } else if c == 39 {
+                if self.peek_at(1) == 39 && self.peek_at(2) == 39 {
+                    return self.fail(Error::InvalidKey, at)
+                }
+                segment = self.parse_literal_string()
+            } else if is_bare_key_char(c) {
+                while is_bare_key_char(self.peek()) {
+                    self.pos += 1
+                }
+                segment = Span { start: at, len: self.pos - at }
+            } else if c == EOF {
+                return self.fail(Error::UnexpectedEnd, at)
+            } else {
+                return self.fail(Error::InvalidKey, at)
+            }
+            if !self.ok() {
+                return false
+            }
+            self.push_key_segment(segment)
+            self.skip_ws()
+            if self.peek() != 46 {
+                return true
+            }
+            self.pos += 1
+            self.skip_ws()
+        }
+        true
+    }
+
+    fn key_segment(self, _ index: u64) -> Span {
+        Span { start: self.key_get(index, 0), len: self.key_get(index, 1) }
+    }
+
+    /// Parse `[a.b]` or `[[a.b]]` and return the table that follows it, or `NONE`.
+    fn parse_header(mut self) -> u64 {
+        let at = self.pos
+        self.pos += 1
+        let array = self.peek() == 91
+        if array {
+            self.pos += 1
+        }
+        self.skip_ws()
+        let base = self.key_count
+        if !self.parse_key() {
+            return NONE
+        }
+        if self.peek() != 93 || (array && self.peek_at(1) != 93) {
+            self.fail(Error::UnexpectedCharacter, self.pos)
+            return NONE
+        }
+        self.pos += if array { 2 } else { 1 }
+        let table = self.open_header(base, at, array)
+        self.key_count = base
+        table
+    }
+
+    fn open_header(mut self, _ base: u64, _ at: u64, _ array: bool) -> u64 {
+        let last = self.key_count - 1
+        let mut table = self.root()
+        let mut i = base
+        while i < last {
+            table = self.descend_for_header(table, self.key_segment(i), at)
+            if table == NONE {
+                return NONE
+            }
+            i += 1
+        }
+        let key = self.key_segment(last)
+        let existing = self.find(table, key)
+        if array {
+            let mut list = existing
+            if list == NONE {
+                list = self.new_node(ARRAY)
+                self.add_flags(list, ARRAY_OF_TABLES)
+                self.attach(table, list, key)
+            } else if self.flags(list) & FROZEN != 0 {
+                self.fail(Error::Immutable, at)
+                return NONE
+            } else if self.node_get(list, KIND) != ARRAY || self.flags(list) & ARRAY_OF_TABLES == 0 {
+                self.fail(Error::DuplicateKey, at)
+                return NONE
+            }
+            let element = self.new_node(TABLE)
+            self.add_flags(element, EXPLICIT)
+            self.attach(list, element, Span { start: 0, len: 0 })
+            return element
+        }
+        if existing == NONE {
+            let created = self.new_node(TABLE)
+            self.add_flags(created, EXPLICIT)
+            self.attach(table, created, key)
+            return created
+        }
+        if self.node_get(existing, KIND) != TABLE {
+            self.fail(Error::DuplicateKey, at)
+            return NONE
+        }
+        if self.flags(existing) & FROZEN != 0 {
+            self.fail(Error::Immutable, at)
+            return NONE
+        }
+        if self.flags(existing) & EXPLICIT != 0 || self.node_get(existing, DOTTED_SECTION) != 0 {
+            self.fail(Error::TableRedefined, at)
+            return NONE
+        }
+        self.add_flags(existing, EXPLICIT)
+        existing
+    }
+
+    /// Follow one segment of a header's key, creating implicit tables. Arrays
+    /// of tables continue in their last element.
+    fn descend_for_header(mut self, _ table: u64, _ key: Span, _ at: u64) -> u64 {
+        let child = self.find(table, key)
+        if child == NONE {
+            let created = self.new_node(TABLE)
+            self.attach(table, created, key)
+            return created
+        }
+        if self.flags(child) & FROZEN != 0 {
+            self.fail(Error::Immutable, at)
+            return NONE
+        }
+        let kind = self.node_get(child, KIND)
+        if kind == TABLE {
+            return child
+        }
+        if kind == ARRAY && self.flags(child) & ARRAY_OF_TABLES != 0 {
+            return self.node_get(child, ingot::document::LAST_CHILD)
+        }
+        self.fail(Error::NotATable, at)
+        NONE
+    }
+
+    /// Parse `key = value` into `table`. Dotted keys create or extend tables
+    /// that only dotted keys of the same `section` have touched.
+    fn parse_key_value(mut self, _ table: u64, _ section: u64) -> bool {
+        let at = self.pos
+        let base = self.key_count
+        if !self.parse_key() {
+            return false
+        }
+        if self.peek() != 61 {
+            if self.peek() == EOF {
+                return self.fail(Error::UnexpectedEnd, self.pos)
+            }
+            return self.fail(Error::ExpectedEquals, self.pos)
+        }
+        self.pos += 1
+        self.skip_ws()
+        let value = self.parse_value()
+        if value == NONE {
+            return false
+        }
+        let inserted = self.insert(table, base, value, section, at)
+        self.key_count = base
+        inserted
+    }
+
+    fn insert(mut self, _ table: u64, _ base: u64, _ value: u64, _ section: u64, _ at: u64) -> bool {
+        let last = self.key_count - 1
+        let mut parent = table
+        let mut i = base
+        while i < last {
+            parent = self.descend_for_dotted_key(parent, self.key_segment(i), section, at)
+            if parent == NONE {
+                return false
+            }
+            i += 1
+        }
+        let key = self.key_segment(last)
+        if self.find(parent, key) != NONE {
+            return self.fail(Error::DuplicateKey, at)
+        }
+        self.attach(parent, value, key)
+        true
+    }
+
+    fn descend_for_dotted_key(mut self, _ table: u64, _ key: Span, _ section: u64, _ at: u64) -> u64 {
+        let child = self.find(table, key)
+        if child == NONE {
+            let created = self.new_node(TABLE)
+            self.node_set(created, DOTTED_SECTION, section)
+            self.attach(table, created, key)
+            return created
+        }
+        if self.node_get(child, KIND) != TABLE {
+            self.fail(Error::DuplicateKey, at)
+            return NONE
+        }
+        if self.flags(child) & FROZEN != 0 {
+            self.fail(Error::Immutable, at)
+            return NONE
+        }
+        let dotted = self.node_get(child, DOTTED_SECTION)
+        if self.flags(child) & EXPLICIT != 0 || (dotted != 0 && dotted != section) {
+            self.fail(Error::TableRedefined, at)
+            return NONE
+        }
+        self.node_set(child, DOTTED_SECTION, section)
+        child
+    }
+
+    // Values.
+
+    /// Parse a value into a new, detached node; `NONE` on error.
+    ///
+    /// Arrays and inline tables are parsed with an explicit stack of open
+    /// containers instead of recursion, so nesting depth is only limited by
+    /// memory.
+    fn parse_value(mut self) -> u64 {
+        let depth = self.frame_count
+        // A completed value that still has to go to its container, or `NONE`
+        // while a value is expected at `pos`.
+        let mut value = NONE
+        while true {
+            if value == NONE {
+                value = self.start_value()
+            } else if self.frame_count == depth {
+                return value
+            } else {
+                value = self.add_to_open_container(value)
+            }
+            if !self.ok() {
+                return NONE
+            }
+        }
+        NONE
+    }
+
+    /// Parse a scalar or open a container. Returns the completed value, or
+    /// `NONE` when a container was opened and expects its first value.
+    fn start_value(mut self) -> u64 {
+        let c = self.peek()
+        if c == 91 {
+            return self.open_array()
+        }
+        if c == 123 {
+            return self.open_inline_table()
+        }
+        self.parse_scalar()
+    }
+
+    /// Start an array. Returns the array if it is empty, else `NONE` after
+    /// pushing a frame that expects its first element.
+    fn open_array(mut self) -> u64 {
+        self.pos += 1
+        let array = self.new_node(ARRAY)
+        if !self.skip_ws_comments_newlines() {
+            return NONE
+        }
+        if self.peek() == 93 {
+            self.pos += 1
+            self.freeze(array)
+            return array
+        }
+        self.push_frame(FRAME_ARRAY, array, 0, 0, self.pos)
+        NONE
+    }
+
+    /// Start an inline table. Returns the table if it is empty, else `NONE`
+    /// after pushing a frame and parsing the first `key =`.
+    fn open_inline_table(mut self) -> u64 {
+        self.pos += 1
+        let table = self.new_node(TABLE)
+        let section = self.allocate_section()
+        self.skip_ws()
+        if self.peek() == 125 {
+            self.pos += 1
+            self.freeze(table)
+            return table
+        }
+        self.push_frame(FRAME_INLINE_TABLE, table, 0, section, self.pos)
+        self.begin_inline_entry()
+        NONE
+    }
+
+    /// Parse `key =` of the next inline table entry and record its key segments.
+    fn begin_inline_entry(mut self) {
+        let frame = self.frame_count - 1
+        let at = self.pos
+        let base = self.key_count
+        if !self.parse_key() {
+            return
+        }
+        if self.peek() != 61 {
+            if self.peek() == EOF {
+                self.fail(Error::UnexpectedEnd, self.pos)
+            } else {
+                self.fail(Error::ExpectedEquals, self.pos)
+            }
+            return
+        }
+        self.pos += 1
+        self.skip_ws()
+        self.frame_set(frame, FRAME_KEY_BASE, base)
+        self.frame_set(frame, FRAME_AT, at)
+    }
+
+    fn push_frame(mut self, _ kind: u64, _ node: u64, _ key_base: u64, _ section: u64, _ at: u64) {
+        core::assert(self.frame_count < self.capacity)
+        let frame = self.frame_count
+        self.frame_count += 1
+        self.frame_set(frame, FRAME_KIND, kind)
+        self.frame_set(frame, FRAME_NODE, node)
+        self.frame_set(frame, FRAME_KEY_BASE, key_base)
+        self.frame_set(frame, FRAME_SECTION, section)
+        self.frame_set(frame, FRAME_AT, at)
+    }
+
+    /// Add a completed `value` to the innermost open container. Returns the
+    /// container if this closed it, else `NONE` (another value is expected).
+    fn add_to_open_container(mut self, _ value: u64) -> u64 {
+        let frame = self.frame_count - 1
+        let container = self.frame_get(frame, FRAME_NODE)
+        if self.frame_get(frame, FRAME_KIND) == FRAME_ARRAY {
+            self.attach(container, value, Span { start: 0, len: 0 })
+            if !self.skip_ws_comments_newlines() {
+                return NONE
+            }
+            let c = self.peek()
+            if c == 44 {
+                self.pos += 1
+                if !self.skip_ws_comments_newlines() {
+                    return NONE
+                }
+                if self.peek() != 93 {
+                    return NONE
+                }
+            } else if c == EOF {
+                self.fail(Error::UnexpectedEnd, self.frame_get(frame, FRAME_AT))
+                return NONE
+            } else if c != 93 {
+                self.fail(Error::UnexpectedCharacter, self.pos)
+                return NONE
+            }
+            self.pos += 1
+            self.frame_count = frame
+            self.freeze(container)
+            return container
+        }
+        let base = self.frame_get(frame, FRAME_KEY_BASE)
+        let section = self.frame_get(frame, FRAME_SECTION)
+        if !self.insert(container, base, value, section, self.frame_get(frame, FRAME_AT)) {
+            return NONE
+        }
+        self.key_count = base
+        self.skip_ws()
+        let c = self.peek()
+        if c == 44 {
+            self.pos += 1
+            self.skip_ws()
+            self.begin_inline_entry()
+            return NONE
+        }
+        if c == 125 {
+            self.pos += 1
+            self.frame_count = frame
+            self.freeze(container)
+            return container
+        }
+        if c == EOF {
+            self.fail(Error::UnexpectedEnd, self.pos)
+        } else {
+            self.fail(Error::UnexpectedCharacter, self.pos)
+        }
+        NONE
+    }
+
+    /// A string, boolean, number or date-time; `NONE` on error.
+    fn parse_scalar(mut self) -> u64 {
+        let at = self.pos
+        let c = self.peek()
+        if c == 34 || c == 39 {
+            let text = if c == 34 { self.parse_basic_string() } else { self.parse_literal_string() }
+            if !self.ok() {
+                return NONE
+            }
+            let node = self.new_node(STRING)
+            self.node_set(node, VALUE_START, text.start)
+            self.node_set(node, VALUE_LEN, text.len)
+            return node
+        }
+        if c == 116 || c == 102 {
+            return self.parse_boolean()
+        }
+        if c == EOF {
+            self.fail(Error::UnexpectedEnd, at)
+            return NONE
+        }
+        if is_digit(c) || c == 43 || c == 45 || c == 105 || c == 110 {
+            return self.parse_number_or_date_time()
+        }
+        self.fail(Error::ExpectedValue, at)
+        NONE
+    }
+
+    fn parse_boolean(mut self) -> u64 {
+        let at = self.pos
+        let mut value: u64 = 0
+        if self.peek() == 116 && self.peek_at(1) == 114 && self.peek_at(2) == 117 && self.peek_at(3) == 101 {
+            value = 1
+            self.pos += 4
+        } else if self.peek() == 102 && self.peek_at(1) == 97 && self.peek_at(2) == 108
+            && self.peek_at(3) == 115 && self.peek_at(4) == 101
+        {
+            self.pos += 5
+        } else {
+            self.fail(Error::ExpectedValue, at)
+            return NONE
+        }
+        let node = self.new_node(BOOLEAN)
+        self.node_set(node, NUMBER, value)
+        node
+    }
+
+    // Strings. They return the span of the decoded bytes appended to the text.
+
+    fn parse_basic_string(mut self) -> Span {
+        if self.peek_at(1) == 34 && self.peek_at(2) == 34 {
+            return self.parse_multiline_basic_string()
+        }
+        self.pos += 1
+        let start = self.text_end()
+        while true {
+            let c = self.peek()
+            if c == 34 {
+                self.pos += 1
+                break
+            }
+            if c == EOF {
+                self.fail(Error::UnexpectedEnd, self.pos)
+                break
+            }
+            if c == 92 {
+                if !self.parse_escape() {
+                    break
+                }
+            } else if c == 10 || c == 13 || is_control(c) {
+                self.fail(Error::ControlCharacter, self.pos)
+                break
+            } else {
+                self.push_text(c.downcast_truncate())
+                self.pos += 1
+            }
+        }
+        Span { start, len: self.text_end() - start }
+    }
+
+    fn parse_multiline_basic_string(mut self) -> Span {
+        self.pos += 3
+        self.skip_newline()
+        let start = self.text_end()
+        while true {
+            let c = self.peek()
+            if c == 34 {
+                if self.closes_multiline(34) {
+                    break
+                }
+            } else if c == EOF {
+                self.fail(Error::UnexpectedEnd, self.pos)
+                break
+            } else if c == 92 {
+                if self.at_line_ending_backslash() {
+                    self.pos += 1
+                    while self.peek() == 32 || self.peek() == 9 || self.skip_newline() {
+                        if self.peek() == 32 || self.peek() == 9 {
+                            self.pos += 1
+                        }
+                    }
+                } else if !self.parse_escape() {
+                    break
+                }
+            } else if !self.copy_multiline_char() {
+                break
+            }
+        }
+        Span { start, len: self.text_end() - start }
+    }
+
+    fn parse_literal_string(mut self) -> Span {
+        if self.peek_at(1) == 39 && self.peek_at(2) == 39 {
+            return self.parse_multiline_literal_string()
+        }
+        self.pos += 1
+        let start = self.text_end()
+        while true {
+            let c = self.peek()
+            if c == 39 {
+                self.pos += 1
+                break
+            }
+            if c == EOF {
+                self.fail(Error::UnexpectedEnd, self.pos)
+                break
+            }
+            if c == 10 || c == 13 || is_control(c) {
+                self.fail(Error::ControlCharacter, self.pos)
+                break
+            }
+            self.push_text(c.downcast_truncate())
+            self.pos += 1
+        }
+        Span { start, len: self.text_end() - start }
+    }
+
+    fn parse_multiline_literal_string(mut self) -> Span {
+        self.pos += 3
+        self.skip_newline()
+        let start = self.text_end()
+        while true {
+            let c = self.peek()
+            if c == 39 {
+                if self.closes_multiline(39) {
+                    break
+                }
+            } else if c == EOF {
+                self.fail(Error::UnexpectedEnd, self.pos)
+                break
+            } else if !self.copy_multiline_char() {
+                break
+            }
+        }
+        Span { start, len: self.text_end() - start }
+    }
+
+    /// At a run of `quote` characters inside a multi-line string: append the
+    /// quotes that belong to the content and report whether the string ends.
+    fn closes_multiline(mut self, _ quote: u64) -> bool {
+        let mut run: u64 = 0
+        while self.peek_at(run) == quote {
+            run += 1
+        }
+        if run > 5 {
+            self.fail(Error::UnexpectedCharacter, self.pos)
+            return true
+        }
+        let content = if run >= 3 { run - 3 } else { run }
+        let mut i: u64 = 0
+        while i < content {
+            self.push_text(quote.downcast_truncate())
+            i += 1
+        }
+        self.pos += run
+        run >= 3
+    }
+
+    /// Copy one character of a multi-line string, normalizing CRLF to LF.
+    fn copy_multiline_char(mut self) -> bool {
+        let c = self.peek()
+        if c == 13 {
+            if self.peek_at(1) != 10 {
+                return self.fail(Error::ControlCharacter, self.pos)
+            }
+            self.pos += 1
+            return true
+        }
+        if c != 10 && is_control(c) {
+            return self.fail(Error::ControlCharacter, self.pos)
+        }
+        self.push_text(c.downcast_truncate())
+        self.pos += 1
+        true
+    }
+
+    /// Consume one LF or CRLF, if present.
+    fn skip_newline(mut self) -> bool {
+        if self.peek() == 10 {
+            self.pos += 1
+            return true
+        }
+        if self.peek() == 13 && self.peek_at(1) == 10 {
+            self.pos += 2
+            return true
+        }
+        false
+    }
+
+    /// Whether the backslash at `pos` is followed by optional whitespace and a new line.
+    fn at_line_ending_backslash(self) -> bool {
+        let mut i: u64 = 1
+        while self.peek_at(i) == 32 || self.peek_at(i) == 9 {
+            i += 1
+        }
+        self.peek_at(i) == 10 || (self.peek_at(i) == 13 && self.peek_at(i + 1) == 10)
+    }
+
+    fn parse_escape(mut self) -> bool {
+        let at = self.pos
+        let c = self.peek_at(1)
+        let mut byte: u64 = 256
+        if c == 98 {
+            byte = 8
+        } else if c == 116 {
+            byte = 9
+        } else if c == 110 {
+            byte = 10
+        } else if c == 102 {
+            byte = 12
+        } else if c == 114 {
+            byte = 13
+        } else if c == 34 {
+            byte = 34
+        } else if c == 92 {
+            byte = 92
+        }
+        if byte < 256 {
+            self.push_text(byte.downcast_truncate())
+            self.pos += 2
+            return true
+        }
+        let digits: u64 = if c == 117 { 4 } else if c == 85 { 8 } else { 0 }
+        if digits == 0 {
+            return self.fail(Error::InvalidEscape, at)
+        }
+        let mut code: u64 = 0
+        let mut i: u64 = 0
+        while i < digits {
+            let value = hex_value(self.peek_at(2 + i))
+            if value > 15 {
+                return self.fail(Error::InvalidEscape, at)
+            }
+            code = code * 16 + value
+            i += 1
+        }
+        if code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
+            return self.fail(Error::InvalidEscape, at)
+        }
+        self.push_utf8(code)
+        self.pos += 2 + digits
+        true
+    }
+
+    fn push_utf8(mut self, _ code: u64) {
+        if code < 0x80 {
+            self.push_text(code.downcast_truncate())
+        } else if code < 0x800 {
+            self.push_text((0xc0 | (code >> 6)).downcast_truncate())
+            self.push_text((0x80 | (code & 0x3f)).downcast_truncate())
+        } else if code < 0x10000 {
+            self.push_text((0xe0 | (code >> 12)).downcast_truncate())
+            self.push_text((0x80 | ((code >> 6) & 0x3f)).downcast_truncate())
+            self.push_text((0x80 | (code & 0x3f)).downcast_truncate())
+        } else {
+            self.push_text((0xf0 | (code >> 18)).downcast_truncate())
+            self.push_text((0x80 | ((code >> 12) & 0x3f)).downcast_truncate())
+            self.push_text((0x80 | ((code >> 6) & 0x3f)).downcast_truncate())
+            self.push_text((0x80 | (code & 0x3f)).downcast_truncate())
+        }
+    }
+
+    // Numbers and date-times.
+
+    fn parse_number_or_date_time(mut self) -> u64 {
+        let start = self.pos
+        while is_token_char(self.peek()) {
+            self.pos += 1
+        }
+        // A date followed by a space and a time is a single date-time.
+        if self.pos - start == 10 && self.mem.byte_at(start + 4) == 45 && self.peek() == 32
+            && is_digit(self.peek_at(1))
+        {
+            self.pos += 1
+            while is_token_char(self.peek()) {
+                self.pos += 1
+            }
+        }
+        let token = Span { start, len: self.pos - start }
+        if token.len >= 5 && self.mem.byte_at(start + 4) == 45 && is_digit(self.mem.byte_at(start) as u64) {
+            return self.parse_date_time(token)
+        }
+        if token.len >= 3 && self.mem.byte_at(start + 2) == 58 {
+            return self.parse_local_time(token)
+        }
+        self.parse_number(token)
+    }
+
+    fn token_byte(self, _ token: Span, _ index: u64) -> u64 {
+        if index < token.len {
+            self.mem.byte_at(token.start + index) as u64
+        } else {
+            EOF
+        }
+    }
+
+    fn parse_number(mut self, _ token: Span) -> u64 {
+        let mut i: u64 = 0
+        let first = self.token_byte(token, 0)
+        let signed = first == 43 || first == 45
+        let negative = first == 45
+        if signed {
+            i = 1
+        }
+        if self.token_is(token, i, 105, 110, 102) || self.token_is(token, i, 110, 97, 110) {
+            if token.len != i + 3 {
+                self.fail(Error::InvalidNumber, token.start)
+                return NONE
+            }
+            let node = self.new_node(FLOAT)
+            let value_start = self.text_end()
+            if negative && self.token_byte(token, i) == 105 {
+                self.push_text(45)
+            }
+            let mut k: u64 = 0
+            while k < 3 {
+                let c = self.token_byte(token, i + k)
+                self.push_text(c.downcast_truncate())
+                k += 1
+            }
+            self.node_set(node, VALUE_START, value_start)
+            self.node_set(node, VALUE_LEN, self.text_end() - value_start)
+            return node
+        }
+        if !signed && first == 48 {
+            let prefix = self.token_byte(token, 1)
+            let radix: u64 = if prefix == 120 { 16 } else if prefix == 111 { 8 } else if prefix == 98 { 2 } else { 0 }
+            if radix != 0 {
+                return self.parse_integer(token, 2, radix, false)
+            }
+        }
+        // Decimal: integer part, then optional fraction and exponent.
+        let int_start = i
+        let int_end = self.digit_run(token, i, 10)
+        if int_end == NONE || int_end == int_start {
+            self.fail(Error::InvalidNumber, token.start)
+            return NONE
+        }
+        if self.token_byte(token, int_start) == 48 && int_end - int_start > 1 {
+            self.fail(Error::InvalidNumber, token.start)
+            return NONE
+        }
+        i = int_end
+        let mut float = false
+        if self.token_byte(token, i) == 46 {
+            let end = self.digit_run(token, i + 1, 10)
+            if end == NONE || end == i + 1 {
+                self.fail(Error::InvalidNumber, token.start)
+                return NONE
+            }
+            i = end
+            float = true
+        }
+        let e = self.token_byte(token, i)
+        if e == 101 || e == 69 {
+            i += 1
+            let sign = self.token_byte(token, i)
+            if sign == 43 || sign == 45 {
+                i += 1
+            }
+            let end = self.digit_run(token, i, 10)
+            if end == NONE || end == i {
+                self.fail(Error::InvalidNumber, token.start)
+                return NONE
+            }
+            i = end
+            float = true
+        }
+        if i != token.len {
+            self.fail(Error::InvalidNumber, token.start)
+            return NONE
+        }
+        if !float {
+            return self.parse_integer(token, int_start, 10, negative)
+        }
+        let node = self.new_node(FLOAT)
+        let value_start = self.text_end()
+        let mut k: u64 = 0
+        while k < token.len {
+            let c = self.token_byte(token, k)
+            if c != 95 {
+                self.push_text(c.downcast_truncate())
+            }
+            k += 1
+        }
+        self.node_set(node, VALUE_START, value_start)
+        self.node_set(node, VALUE_LEN, self.text_end() - value_start)
+        node
+    }
+
+    fn token_is(self, _ token: Span, _ at: u64, _ a: u64, _ b: u64, _ c: u64) -> bool {
+        self.token_byte(token, at) == a && self.token_byte(token, at + 1) == b
+            && self.token_byte(token, at + 2) == c
+    }
+
+    /// Skip digits of `radix` with single underscores between them, starting
+    /// at `at`. Returns the index after the run, or `NONE` for a misplaced underscore.
+    fn digit_run(self, _ token: Span, _ at: u64, _ radix: u64) -> u64 {
+        let mut i = at
+        while true {
+            let c = self.token_byte(token, i)
+            if digit_value(c) < radix {
+                i += 1
+            } else if c == 95 {
+                if i == at || digit_value(self.token_byte(token, i + 1)) >= radix {
+                    return NONE
+                }
+                i += 1
+            } else {
+                return i
+            }
+        }
+        i
+    }
+
+    /// The integer in `token` from `at` on, all digits of `radix`.
+    fn parse_integer(mut self, _ token: Span, _ at: u64, _ radix: u64, _ negative: bool) -> u64 {
+        let end = self.digit_run(token, at, radix)
+        if end == NONE || end == at || end != token.len {
+            self.fail(Error::InvalidNumber, token.start)
+            return NONE
+        }
+        let limit: u64 = if negative { 0x8000000000000000 } else { 0x7fffffffffffffff }
+        let mut value: u64 = 0
+        let mut i = at
+        while i < end {
+            let digit = digit_value(self.token_byte(token, i))
+            if digit < radix {
+                if value > (limit - digit) / radix {
+                    self.fail(Error::IntegerOutOfRange, token.start)
+                    return NONE
+                }
+                value = value * radix + digit
+            }
+            i += 1
+        }
+        let node = self.new_node(INTEGER)
+        self.node_set(node, NUMBER, value)
+        if negative && value != 0 {
+            self.add_flags(node, NEGATIVE)
+        }
+        node
+    }
+
+    fn parse_date_time(mut self, _ token: Span) -> u64 {
+        let year = self.fixed_digits(token, 0, 4)
+        let month = self.fixed_digits(token, 5, 2)
+        let day = self.fixed_digits(token, 8, 2)
+        if year == NONE || month == NONE || day == NONE || self.token_byte(token, 7) != 45
+            || month < 1 || month > 12 || day < 1 || day > days_in_month(year, month)
+        {
+            self.fail(Error::InvalidDateTime, token.start)
+            return NONE
+        }
+        if token.len == 10 {
+            return self.date_time_node(token, LOCAL_DATE)
+        }
+        let separator = self.token_byte(token, 10)
+        if separator != 84 && separator != 116 && separator != 32 {
+            self.fail(Error::InvalidDateTime, token.start)
+            return NONE
+        }
+        let mut i = self.time_end(token, 11)
+        if i == NONE {
+            self.fail(Error::InvalidDateTime, token.start)
+            return NONE
+        }
+        if i == token.len {
+            return self.date_time_node(token, LOCAL_DATE_TIME)
+        }
+        let c = self.token_byte(token, i)
+        if c == 90 || c == 122 {
+            i += 1
+        } else if c == 43 || c == 45 {
+            let hours = self.fixed_digits(token, i + 1, 2)
+            let minutes = self.fixed_digits(token, i + 4, 2)
+            if hours == NONE || minutes == NONE || self.token_byte(token, i + 3) != 58 || hours > 23
+                || minutes > 59
+            {
+                self.fail(Error::InvalidDateTime, token.start)
+                return NONE
+            }
+            i += 6
+        }
+        if i != token.len {
+            self.fail(Error::InvalidDateTime, token.start)
+            return NONE
+        }
+        self.date_time_node(token, OFFSET_DATE_TIME)
+    }
+
+    fn parse_local_time(mut self, _ token: Span) -> u64 {
+        if self.time_end(token, 0) != token.len {
+            self.fail(Error::InvalidDateTime, token.start)
+            return NONE
+        }
+        self.date_time_node(token, LOCAL_TIME)
+    }
+
+    /// Validate `HH:MM:SS[.fraction]` at `at`; the index after it, or `NONE`.
+    fn time_end(self, _ token: Span, _ at: u64) -> u64 {
+        let hours = self.fixed_digits(token, at, 2)
+        let minutes = self.fixed_digits(token, at + 3, 2)
+        let seconds = self.fixed_digits(token, at + 6, 2)
+        if hours == NONE || minutes == NONE || seconds == NONE || self.token_byte(token, at + 2) != 58
+            || self.token_byte(token, at + 5) != 58 || hours > 23 || minutes > 59 || seconds > 59
+        {
+            return NONE
+        }
+        let mut i = at + 8
+        if self.token_byte(token, i) == 46 {
+            i += 1
+            let digits_start = i
+            while is_digit(self.token_byte(token, i)) {
+                i += 1
+            }
+            if i == digits_start {
+                return NONE
+            }
+        }
+        i
+    }
+
+    /// The decimal number of exactly `count` digits at `at`, or `NONE`.
+    fn fixed_digits(self, _ token: Span, _ at: u64, _ count: u64) -> u64 {
+        let mut value: u64 = 0
+        let mut i: u64 = 0
+        while i < count {
+            let c = self.token_byte(token, at + i)
+            if !is_digit(c) {
+                return NONE
+            }
+            value = value * 10 + c - 48
+            i += 1
+        }
+        value
+    }
+
+    /// A date-time node with the token's text, using `T` and `Z` in upper case.
+    fn date_time_node(mut self, _ token: Span, _ kind: u64) -> u64 {
+        let node = self.new_node(kind)
+        let start = self.text_end()
+        let mut i: u64 = 0
+        while i < token.len {
+            let mut c = self.token_byte(token, i)
+            if c == 32 || c == 116 {
+                c = 84
+            } else if c == 122 {
+                c = 90
+            }
+            self.push_text(c.downcast_truncate())
+            i += 1
+        }
+        self.node_set(node, VALUE_START, start)
+        self.node_set(node, VALUE_LEN, token.len)
+        node
+    }
+}
+
+/// Control characters other than tab, which TOML doesn't allow in comments and strings.
+fn is_control(_ c: u64) -> bool {
+    (c < 32 && c != 9) || c == 127
+}
+
+fn is_digit(_ c: u64) -> bool {
+    c >= 48 && c <= 57
+}
+
+fn is_bare_key_char(_ c: u64) -> bool {
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || is_digit(c) || c == 95 || c == 45
+}
+
+/// Characters that can appear in numbers and date-times.
+fn is_token_char(_ c: u64) -> bool {
+    is_bare_key_char(c) || c == 43 || c == 46 || c == 58
+}
+
+/// The value of a digit in any radix up to 16, or 99.
+fn digit_value(_ c: u64) -> u64 {
+    if is_digit(c) {
+        c - 48
+    } else {
+        hex_value(c)
+    }
+}
+
+fn hex_value(_ c: u64) -> u64 {
+    if is_digit(c) {
+        c - 48
+    } else if c >= 97 && c <= 102 {
+        c - 87
+    } else if c >= 65 && c <= 70 {
+        c - 55
+    } else {
+        99
+    }
+}
+
+fn days_in_month(_ year: u64, _ month: u64) -> u64 {
+    if month == 2 {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+        return if leap { 29 } else { 28 }
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        return 30
+    }
+    31
+}

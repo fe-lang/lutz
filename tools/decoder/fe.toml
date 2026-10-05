@@ -1,0 +1,6 @@
+[ingot]
+name = "decoder"
+version = "0.1.0"
+
+[dependencies]
+lutz = true

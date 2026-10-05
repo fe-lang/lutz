@@ -1,0 +1,124 @@
+use core::Option
+use ingot::document::{Document, Error, Key, NONE, push_lit}
+use ingot::parser::parse
+use std::native::ByteBuffer
+
+fn parse_text<T: Key>(_ text: T) -> Document {
+    let mut source = ByteBuffer::new()
+    push_lit(mut source, text)
+    let doc = parse(source, 0, source.len())
+    source.release()
+    doc
+}
+
+fn node<T: Key>(_ doc: Document, _ table: u64, _ key: T) -> u64 {
+    match doc.get(table, key) {
+        Option::Some(node) => node
+        Option::None => NONE
+    }
+}
+
+fn value_is<T: Key>(_ doc: Document, _ node: u64, _ expected: T) -> bool {
+    let span = doc.value(node)
+    let bytes = expected.bytes()
+    if span.len as usize != T::SIZE {
+        return false
+    }
+    let mut i: u64 = 0
+    while i < span.len {
+        if doc.byte_at(span.start + i) != bytes[i as usize] {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+#[test]
+fn tables_and_values() {
+    let doc = parse_text("a = 1\n[t.u]\nb = \"x\\ty\"\n")
+    core::assert(doc.ok())
+    let a = node(doc, doc.root(), "a")
+    core::assert(doc.is_integer(a) && doc.integer(a) == 1)
+    let u = node(doc, node(doc, doc.root(), "t"), "u")
+    core::assert(doc.is_table(u) && doc.len(u) == 1)
+    let b = node(doc, u, "b")
+    core::assert(doc.is_string(b) && value_is(doc, b, "x\ty"))
+    core::assert(node(doc, doc.root(), "missing") == NONE)
+    doc.release()
+}
+
+#[test]
+fn arrays_keep_order() {
+    let doc = parse_text("xs = [3, -2, 0x10]\n")
+    core::assert(doc.ok())
+    let xs = node(doc, doc.root(), "xs")
+    core::assert(doc.is_array(xs) && doc.len(xs) == 3)
+    core::assert(doc.integer(doc.at(xs, 0)) == 3)
+    core::assert(doc.integer(doc.at(xs, 1)) == -2)
+    core::assert(doc.integer(doc.at(xs, 2)) == 16)
+    core::assert(doc.at(xs, 3) == NONE)
+    doc.release()
+}
+
+#[test]
+fn integer_limits() {
+    let lo = parse_text("lo = -9223372036854775808\n")
+    core::assert(lo.ok() && lo.integer(node(lo, lo.root(), "lo")) == -9223372036854775807 - 1)
+    lo.release()
+    let hi = parse_text("hi = 9223372036854775807\n")
+    core::assert(hi.ok() && hi.integer(node(hi, hi.root(), "hi")) == 9223372036854775807)
+    hi.release()
+    let over = parse_text("x = 9223372036854775808\n")
+    core::assert(!over.ok())
+    over.release()
+}
+
+#[test]
+fn errors_have_positions() {
+    let doc = parse_text("a = 1\na = 2\n")
+    core::assert(!doc.ok())
+    match doc.error() {
+        Option::Some(Error::DuplicateKey) => {}
+        _ => core::assert(false)
+    }
+    let mut message = ByteBuffer::new()
+    doc.push_error(mut message)
+    // "line 2, column 1: duplicate key"
+    core::assert(message.len() == 31 && message.byte_at(5) == 50 && message.byte_at(15) == 49)
+    message.release()
+    doc.release()
+}
+
+// The example from the README.
+
+fn port(_ source: ByteBuffer) -> i64 {
+    let doc = parse(source, 0, source.len())
+    let mut port: i64 = 0
+    if doc.ok() {
+        let node = entry(doc, entry(doc, doc.root(), "server"), "port")
+        if node != NONE && doc.is_integer(node) {
+            port = doc.integer(node)
+        }
+    }
+    doc.release()
+    port
+}
+
+fn entry<K: Key>(_ doc: Document, _ table: u64, _ key: K) -> u64 {
+    match doc.get(table, key) {
+        Option::Some(node) => node
+        Option::None => NONE
+    }
+}
+
+#[test]
+fn readme_example() {
+    let mut source = ByteBuffer::new()
+    push_lit(mut source, "[server]\nport = 8080\n")
+    core::assert(port(source) == 8080)
+    source.clear()
+    push_lit(mut source, "[server]\nport = \"x\"\n")
+    core::assert(port(source) == 0)
+    source.release()
+}

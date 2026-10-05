@@ -1,0 +1,11 @@
+//! lutz: a TOML 1.0 parser for native Fe programs. Lutz unravels TOML zealously.
+//!
+//!     let doc = lutz::parse(source, start, len)
+//!     if !doc.ok() { doc.push_error(mut message) }
+//!     match doc.get(doc.root(), "package") { ... }
+//!
+//! The document is a tree of nodes addressed by `u64` handles (`NONE` when
+//! absent). Tables and arrays keep their entries in source order.
+
+pub use document::{Document, Error, Key, Kind, NONE, Span}
+pub use parser::parse

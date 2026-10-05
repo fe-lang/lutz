@@ -1,0 +1,142 @@
+//! A decoder for the toml-test suite (https://github.com/toml-lang/toml-test):
+//! reads TOML on stdin and writes its tagged JSON form to stdout. Invalid
+//! TOML exits with status 1 and an error message.
+
+use lutz::{Document, Key, Kind, NONE}
+use std::io::{Read, Write, host, read_char, write_char}
+use std::native::ByteBuffer
+
+pub fn main() -> i32 {
+    let mut input = ByteBuffer::new()
+    let mut out = ByteBuffer::new()
+    let code = with (Read = host(), Write = host()) {
+        read_all(mut input)
+        let doc = lutz::parse(input, 0, input.len())
+        let code = if doc.ok() {
+            emit(doc, doc.root(), mut out)
+            push(mut out, 10)
+            0
+        } else {
+            doc.push_error(mut out)
+            push(mut out, 10)
+            1
+        }
+        doc.release()
+        let mut i: u64 = 0
+        while i < out.len() {
+            write_char(out.byte_at(i) as i32)
+            i += 1
+        }
+        code
+    }
+    input.release()
+    out.release()
+    code
+}
+
+fn read_all(_ input: mut ByteBuffer) uses (r: mut Read) {
+    let mut c = read_char()
+    while c >= 0 {
+        push(mut input, c.downcast_unchecked())
+        c = read_char()
+    }
+}
+
+fn push(_ buf: mut ByteBuffer, _ byte: u8) {
+    let len = buf.len()
+    core::assert(buf.try_resize(len + 1))
+    buf.set_byte(index: len, value: byte)
+}
+
+fn push_text<T: Key>(_ buf: mut ByteBuffer, _ text: T) {
+    let bytes = text.bytes()
+    let mut i: usize = 0
+    while i < T::SIZE {
+        push(mut buf, bytes[i])
+        i += 1
+    }
+}
+
+fn emit(_ doc: Document, _ node: u64, _ out: mut ByteBuffer) {
+    match doc.kind(node) {
+        Kind::Table => {
+            push(mut out, 123)
+            let mut child = doc.first(node)
+            while child != NONE {
+                if child != doc.first(node) {
+                    push(mut out, 44)
+                }
+                emit_string(doc, doc.key(child), mut out)
+                push(mut out, 58)
+                emit(doc, child, mut out)
+                child = doc.next(child)
+            }
+            push(mut out, 125)
+        }
+        Kind::Array => {
+            push(mut out, 91)
+            let mut child = doc.first(node)
+            while child != NONE {
+                if child != doc.first(node) {
+                    push(mut out, 44)
+                }
+                emit(doc, child, mut out)
+                child = doc.next(child)
+            }
+            push(mut out, 93)
+        }
+        Kind::String => emit_scalar(doc, node, "string", mut out)
+        Kind::Integer => {
+            push_text(mut out, "{\"type\":\"integer\",\"value\":\"")
+            doc.push_integer(node, mut out)
+            push_text(mut out, "\"}")
+        }
+        Kind::Float => emit_scalar(doc, node, "float", mut out)
+        Kind::Boolean => {
+            if doc.boolean(node) {
+                push_text(mut out, "{\"type\":\"bool\",")
+                push_text(mut out, "\"value\":\"true\"}")
+            } else {
+                push_text(mut out, "{\"type\":\"bool\",")
+                push_text(mut out, "\"value\":\"false\"}")
+            }
+        }
+        Kind::OffsetDateTime => emit_scalar(doc, node, "datetime", mut out)
+        Kind::LocalDateTime => emit_scalar(doc, node, "datetime-local", mut out)
+        Kind::LocalDate => emit_scalar(doc, node, "date-local", mut out)
+        Kind::LocalTime => emit_scalar(doc, node, "time-local", mut out)
+    }
+}
+
+fn emit_scalar<T: Key>(_ doc: Document, _ node: u64, _ kind: T, _ out: mut ByteBuffer) {
+    push_text(mut out, "{\"type\":\"")
+    push_text(mut out, kind)
+    push_text(mut out, "\",\"value\":")
+    emit_string(doc, doc.value(node), mut out)
+    push(mut out, 125)
+}
+
+/// A JSON string of the document text in `span`.
+fn emit_string(_ doc: Document, _ span: lutz::Span, _ out: mut ByteBuffer) {
+    push(mut out, 34)
+    let mut i: u64 = 0
+    while i < span.len {
+        let c = doc.byte_at(span.start + i)
+        if c == 34 || c == 92 {
+            push(mut out, 92)
+            push(mut out, c)
+        } else if c < 32 || c == 127 {
+            push_text(mut out, "\\u00")
+            push(mut out, hex_digit(c >> 4))
+            push(mut out, hex_digit(c & 15))
+        } else {
+            push(mut out, c)
+        }
+        i += 1
+    }
+    push(mut out, 34)
+}
+
+fn hex_digit(_ value: u8) -> u8 {
+    if value < 10 { 48 + value } else { 87 + value }
+}
