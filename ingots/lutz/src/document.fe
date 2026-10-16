@@ -151,7 +151,7 @@ impl Document {
         let keys_base = nodes_base + capacity * COLUMNS * 8
         let frames_base = keys_base + capacity * KEY_COLUMNS * 8
         let mem = MemBuffer::alloc((frames_base + capacity * FRAME_COLUMNS * 8) as u256)
-        let mut doc = Self {
+        var doc = Self {
             mem,
             source_len,
             text_base,
@@ -200,9 +200,9 @@ impl Document {
 
     /// Append `line <l>, column <c>: <description>` for the parse error.
     pub fn push_error<O: Sink>(self, _ out: mut O) {
-        let mut line: u64 = 1
-        let mut column: u64 = 1
-        let mut i: u64 = 0
+        var line: u64 = 1
+        var column: u64 = 1
+        var i: u64 = 0
         while i < self.error_pos && i < self.source_len {
             if self.byte(i) == 10 {
                 line += 1
@@ -289,8 +289,8 @@ impl Document {
 
     /// The array element at `index`, or `NONE`.
     pub fn at(self, _ array: u64, _ index: u64) -> u64 {
-        let mut node = self.first(array)
-        let mut i: u64 = 0
+        var node = self.first(array)
+        var i: u64 = 0
         while i < index && node != NONE {
             node = self.next(node)
             i += 1
@@ -304,12 +304,12 @@ impl Document {
             return Option::None
         }
         let bytes = key.bytes()
-        let mut node = self.first(table)
+        var node = self.first(table)
         while node != NONE {
             let name = self.key(node)
             if name.len as usize == T::SIZE {
-                let mut same = true
-                let mut i: u64 = 0
+                var same = true
+                var i: u64 = 0
                 while same && i < name.len {
                     same = self.byte(name.start + i) == bytes[i as usize]
                     i += 1
@@ -350,7 +350,7 @@ impl Document {
     }
 
     fn push_span<O: Sink>(self, _ span: Span, _ out: mut O) {
-        let mut i: u64 = 0
+        var i: u64 = 0
         while i < span.len {
             push(mut out, self.byte(span.start + i))
             i += 1
@@ -389,7 +389,7 @@ impl Document {
         core::assert(node < self.capacity)
         self.node_count += 1
         // The arena isn't zeroed: initialize every column.
-        let mut column: u64 = 0
+        var column: u64 = 0
         while column < COLUMNS {
             self.node_set(node, column, 0)
             column += 1
@@ -443,16 +443,16 @@ impl Document {
     }
 
     pub(ingot) fn byte(self, _ index: u64) -> u8 {
-        *offset_bytes(self.mem.ptr(), index as u256)
+        self.mem[index as usize]
     }
 
     pub(ingot) fn store(mut self, _ index: u64, _ value: u8) {
-        *offset_bytes(self.mem.ptr(), index as u256) = value
+        self.mem[index as usize] = value
     }
 
     fn read_word(self, _ at: u64) -> u64 {
-        let mut value: u64 = 0
-        let mut i: u64 = 8
+        var value: u64 = 0
+        var i: u64 = 8
         while i > 0 {
             i -= 1
             value = (value << 8) | self.byte(at + i) as u64
@@ -461,7 +461,7 @@ impl Document {
     }
 
     fn write_word(mut self, _ at: u64, _ value: u64) {
-        let mut i: u64 = 0
+        var i: u64 = 0
         while i < 8 {
             self.store(at + i, ((value >> (i * 8)) & 0xff).downcast_truncate())
             i += 1
@@ -485,12 +485,12 @@ impl Document {
 
     /// The entry of `table` whose key equals `key` (a span of the text), or `NONE`.
     pub(ingot) fn find(self, _ table: u64, _ key: Span) -> u64 {
-        let mut node = self.first(table)
+        var node = self.first(table)
         while node != NONE {
             let name = self.key(node)
             if name.len == key.len {
-                let mut same = true
-                let mut i: u64 = 0
+                var same = true
+                var i: u64 = 0
                 while same && i < key.len {
                     same = self.byte(name.start + i) == self.byte(key.start + i)
                     i += 1
@@ -515,7 +515,7 @@ impl Document {
     /// Mark `node` and everything below it as frozen. Values are parsed
     /// depth first, so the nodes below `node` are the ones created after it.
     pub(ingot) fn freeze(mut self, _ node: u64) {
-        let mut i = node
+        var i = node
         while i < self.node_count {
             self.add_flags(i, FROZEN)
             i += 1
@@ -553,7 +553,7 @@ pub(ingot) fn push<O: Sink>(_ out: mut O, _ byte: u8) {
 
 pub(ingot) fn push_lit<T: Key, O: Sink>(_ out: mut O, _ text: T) {
     let bytes = text.bytes()
-    let mut i: usize = 0
+    var i: usize = 0
     while i < T::SIZE {
         out.push_byte(bytes[i])
         i += 1
@@ -561,7 +561,7 @@ pub(ingot) fn push_lit<T: Key, O: Sink>(_ out: mut O, _ text: T) {
 }
 
 pub(ingot) fn push_decimal<O: Sink>(_ out: mut O, _ value: u64) {
-    let mut divisor: u64 = 1
+    var divisor: u64 = 1
     while value / divisor >= 10 {
         divisor *= 10
     }
@@ -598,8 +598,10 @@ pub trait Sink {
 impl Sink for MemBuffer {
     fn push_byte(mut self, _ byte: u8) {
         self.reserve(1)
-        *offset_bytes(self.ptr(), self.len()) = byte
-        self.set_len(self.len() + 1)
+        unsafe {
+            *offset_bytes(self.ptr(), self.len()) = byte
+            self.set_len(self.len() + 1)
+        }
     }
 }
 

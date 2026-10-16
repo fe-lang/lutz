@@ -4,7 +4,7 @@ use ingot::parser::parse
 use core::ptr::{MemBuffer, MemSpan}
 
 fn parse_text<T: Key>(_ text: T) -> Document {
-    let mut source = MemBuffer::empty()
+    var source = MemBuffer::empty()
     push_lit(mut source, text)
     parse(source.span(), 0, source.len().downcast_unchecked())
 }
@@ -22,7 +22,7 @@ fn value_is<T: Key>(_ doc: Document, _ node: u64, _ expected: T) -> bool {
     if span.len as usize != T::SIZE {
         return false
     }
-    let mut i: u64 = 0
+    var i: u64 = 0
     while i < span.len {
         if doc.byte_at(span.start + i) != bytes[i as usize] {
             return false
@@ -80,7 +80,7 @@ fn errors_have_positions() {
         Option::Some(Error::DuplicateKey) => {}
         _ => core::assert(false)
     }
-    let mut message = MemBuffer::empty()
+    var message = MemBuffer::empty()
     doc.push_error(mut message)
     // "line 2, column 1: duplicate key"
     let text = message.span()
@@ -92,7 +92,7 @@ fn errors_have_positions() {
 
 fn port(_ source: MemSpan) -> i64 {
     let doc = parse(source, 0, source.len().downcast_unchecked())
-    let mut port: i64 = 0
+    var port: i64 = 0
     if doc.ok() {
         let node = entry(doc, entry(doc, doc.root(), "server"), "port")
         if node != NONE && doc.is_integer(node) {
@@ -112,10 +112,10 @@ fn entry<K: Key>(_ doc: Document, _ table: u64, _ key: K) -> u64 {
 
 #[test]
 fn readme_example() {
-    let mut source = MemBuffer::empty()
+    var source = MemBuffer::empty()
     push_lit(mut source, "[server]\nport = 8080\n")
     core::assert(port(source.span()) == 8080)
-    let mut other = MemBuffer::empty()
+    var other = MemBuffer::empty()
     push_lit(mut other, "[server]\nport = \"x\"\n")
     core::assert(port(other.span()) == 0)
 }

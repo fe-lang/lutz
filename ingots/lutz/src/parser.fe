@@ -26,8 +26,8 @@ const FRAME_INLINE_TABLE: u64 = 1
 /// Parse `len` bytes of `source` (a `MemSpan`, a native `ByteBuffer`, or any
 /// other `Source`), starting at `start`. Check `ok()` on the result.
 pub fn parse<S: Source>(_ source: S, _ start: u64, _ len: u64) -> Document {
-    let mut doc = Document::new(len)
-    let mut i: u64 = 0
+    var doc = Document::new(len)
+    var i: u64 = 0
     while i < len {
         doc.store(i, source.source_byte(start + i))
         i += 1
@@ -67,8 +67,8 @@ impl Document {
         if !self.check_utf8() {
             return
         }
-        let mut table: u64 = self.root()
-        let mut section = self.allocate_section()
+        var table: u64 = self.root()
+        var section = self.allocate_section()
         while true {
             self.skip_ws()
             let c = self.peek()
@@ -95,7 +95,7 @@ impl Document {
 
     /// Validate the source as UTF-8 without overlong forms or surrogates.
     fn check_utf8(mut self) -> bool {
-        let mut i: u64 = 0
+        var i: u64 = 0
         while i < self.source_len {
             let length = self.utf8_length(i)
             if length == 0 {
@@ -112,9 +112,9 @@ impl Document {
         if b < 0x80 {
             return 1
         }
-        let mut extra: u64 = 3
-        let mut min: u64 = 0x10000
-        let mut code: u64 = (b & 0x07) as u64
+        var extra: u64 = 3
+        var min: u64 = 0x10000
+        var code: u64 = (b & 0x07) as u64
         if b & 0xe0 == 0xc0 {
             extra = 1
             min = 0x80
@@ -126,7 +126,7 @@ impl Document {
         } else if b & 0xf8 != 0xf0 {
             return 0
         }
-        let mut k: u64 = 1
+        var k: u64 = 1
         while k <= extra {
             if at + k >= self.source_len || self.byte(at + k) & 0xc0 != 0x80 {
                 return 0
@@ -213,7 +213,7 @@ impl Document {
         while true {
             let at = self.pos
             let c = self.peek()
-            let mut segment = Span { start: 0, len: 0 }
+            var segment = Span { start: 0, len: 0 }
             if c == 34 {
                 if self.peek_at(1) == 34 && self.peek_at(2) == 34 {
                     return self.fail(Error::InvalidKey, at)
@@ -277,8 +277,8 @@ impl Document {
 
     fn open_header(mut self, _ base: u64, _ at: u64, _ array: bool) -> u64 {
         let last = self.key_count - 1
-        let mut table = self.root()
-        let mut i = base
+        var table = self.root()
+        var i = base
         while i < last {
             table = self.descend_for_header(table, self.key_segment(i), at)
             if table == NONE {
@@ -289,7 +289,7 @@ impl Document {
         let key = self.key_segment(last)
         let existing = self.find(table, key)
         if array {
-            let mut list = existing
+            var list = existing
             if list == NONE {
                 list = self.new_node(ARRAY)
                 self.add_flags(list, ARRAY_OF_TABLES)
@@ -379,8 +379,8 @@ impl Document {
 
     fn insert(mut self, _ table: u64, _ base: u64, _ value: u64, _ section: u64, _ at: u64) -> bool {
         let last = self.key_count - 1
-        let mut parent = table
-        let mut i = base
+        var parent = table
+        var i = base
         while i < last {
             parent = self.descend_for_dotted_key(parent, self.key_segment(i), section, at)
             if parent == NONE {
@@ -432,7 +432,7 @@ impl Document {
         let depth = self.frame_count
         // A completed value that still has to go to its container, or `NONE`
         // while a value is expected at `pos`.
-        let mut value = NONE
+        var value = NONE
         while true {
             if value == NONE {
                 value = self.start_value()
@@ -617,7 +617,7 @@ impl Document {
 
     fn parse_boolean(mut self) -> u64 {
         let at = self.pos
-        let mut value: u64 = 0
+        var value: u64 = 0
         if self.peek() == 116 && self.peek_at(1) == 114 && self.peek_at(2) == 117 && self.peek_at(3) == 101 {
             value = 1
             self.pos += 4
@@ -747,7 +747,7 @@ impl Document {
     /// At a run of `quote` characters inside a multi-line string: append the
     /// quotes that belong to the content and report whether the string ends.
     fn closes_multiline(mut self, _ quote: u64) -> bool {
-        let mut run: u64 = 0
+        var run: u64 = 0
         while self.peek_at(run) == quote {
             run += 1
         }
@@ -756,7 +756,7 @@ impl Document {
             return true
         }
         let content = if run >= 3 { run - 3 } else { run }
-        let mut i: u64 = 0
+        var i: u64 = 0
         while i < content {
             self.push_text(quote.downcast_truncate())
             i += 1
@@ -798,7 +798,7 @@ impl Document {
 
     /// Whether the backslash at `pos` is followed by optional whitespace and a new line.
     fn at_line_ending_backslash(self) -> bool {
-        let mut i: u64 = 1
+        var i: u64 = 1
         while self.peek_at(i) == 32 || self.peek_at(i) == 9 {
             i += 1
         }
@@ -808,7 +808,7 @@ impl Document {
     fn parse_escape(mut self) -> bool {
         let at = self.pos
         let c = self.peek_at(1)
-        let mut byte: u64 = 256
+        var byte: u64 = 256
         if c == 98 {
             byte = 8
         } else if c == 116 {
@@ -833,8 +833,8 @@ impl Document {
         if digits == 0 {
             return self.fail(Error::InvalidEscape, at)
         }
-        let mut code: u64 = 0
-        let mut i: u64 = 0
+        var code: u64 = 0
+        var i: u64 = 0
         while i < digits {
             let value = hex_value(self.peek_at(2 + i))
             if value > 15 {
@@ -904,7 +904,7 @@ impl Document {
     }
 
     fn parse_number(mut self, _ token: Span) -> u64 {
-        let mut i: u64 = 0
+        var i: u64 = 0
         let first = self.token_byte(token, 0)
         let signed = first == 43 || first == 45
         let negative = first == 45
@@ -921,7 +921,7 @@ impl Document {
             if negative && self.token_byte(token, i) == 105 {
                 self.push_text(45)
             }
-            let mut k: u64 = 0
+            var k: u64 = 0
             while k < 3 {
                 let c = self.token_byte(token, i + k)
                 self.push_text(c.downcast_truncate())
@@ -950,7 +950,7 @@ impl Document {
             return NONE
         }
         i = int_end
-        let mut float = false
+        var float = false
         if self.token_byte(token, i) == 46 {
             let end = self.digit_run(token, i + 1, 10)
             if end == NONE || end == i + 1 {
@@ -984,7 +984,7 @@ impl Document {
         }
         let node = self.new_node(FLOAT)
         let value_start = self.text_end()
-        let mut k: u64 = 0
+        var k: u64 = 0
         while k < token.len {
             let c = self.token_byte(token, k)
             if c != 95 {
@@ -1005,7 +1005,7 @@ impl Document {
     /// Skip digits of `radix` with single underscores between them, starting
     /// at `at`. Returns the index after the run, or `NONE` for a misplaced underscore.
     fn digit_run(self, _ token: Span, _ at: u64, _ radix: u64) -> u64 {
-        let mut i = at
+        var i = at
         while true {
             let c = self.token_byte(token, i)
             if digit_value(c) < radix {
@@ -1030,8 +1030,8 @@ impl Document {
             return NONE
         }
         let limit: u64 = if negative { 0x8000000000000000 } else { 0x7fffffffffffffff }
-        let mut value: u64 = 0
-        let mut i = at
+        var value: u64 = 0
+        var i = at
         while i < end {
             let digit = digit_value(self.token_byte(token, i))
             if digit < radix {
@@ -1069,7 +1069,7 @@ impl Document {
             self.fail(Error::InvalidDateTime, token.start)
             return NONE
         }
-        let mut i = self.time_end(token, 11)
+        var i = self.time_end(token, 11)
         if i == NONE {
             self.fail(Error::InvalidDateTime, token.start)
             return NONE
@@ -1116,7 +1116,7 @@ impl Document {
         {
             return NONE
         }
-        let mut i = at + 8
+        var i = at + 8
         if self.token_byte(token, i) == 46 {
             i += 1
             let digits_start = i
@@ -1132,8 +1132,8 @@ impl Document {
 
     /// The decimal number of exactly `count` digits at `at`, or `NONE`.
     fn fixed_digits(self, _ token: Span, _ at: u64, _ count: u64) -> u64 {
-        let mut value: u64 = 0
-        let mut i: u64 = 0
+        var value: u64 = 0
+        var i: u64 = 0
         while i < count {
             let c = self.token_byte(token, at + i)
             if !is_digit(c) {
@@ -1149,9 +1149,9 @@ impl Document {
     fn date_time_node(mut self, _ token: Span, _ kind: u64) -> u64 {
         let node = self.new_node(kind)
         let start = self.text_end()
-        let mut i: u64 = 0
+        var i: u64 = 0
         while i < token.len {
-            let mut c = self.token_byte(token, i)
+            var c = self.token_byte(token, i)
             if c == 32 || c == 116 {
                 c = 84
             } else if c == 122 {
