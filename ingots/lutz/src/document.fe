@@ -94,7 +94,7 @@ pub trait Key {
 impl<const LEN: usize> Key for String<LEN> {
     const SIZE: usize = LEN
     fn bytes(self) -> [u8; Self::SIZE] {
-        self.as_bytes()
+        self.as_bytes().to_array()
     }
 }
 
@@ -150,7 +150,7 @@ impl Document {
         let nodes_base = text_base + source_len
         let keys_base = nodes_base + capacity * COLUMNS * 8
         let frames_base = keys_base + capacity * KEY_COLUMNS * 8
-        let mem = MemBuffer::alloc((frames_base + capacity * FRAME_COLUMNS * 8) as u256)
+        let mem = MemBuffer::alloc((frames_base + capacity * FRAME_COLUMNS * 8) as usize)
         var doc = Self {
             mem,
             source_len,
@@ -579,7 +579,7 @@ pub trait Source {
 /// A byte view of linear memory, on any backend.
 impl Source for MemSpan {
     fn source_byte(self, _ index: u64) -> u8 {
-        self.byte_at(index as u256)
+        self.byte_at(index as usize)
     }
 }
 
@@ -598,8 +598,9 @@ pub trait Sink {
 impl Sink for MemBuffer {
     fn push_byte(mut self, _ byte: u8) {
         self.reserve(1)
+        // `reserve` made room for the byte, which is written before the extent grows.
         unsafe {
-            *offset_bytes(self.ptr(), self.len()) = byte
+            *offset_bytes(self.ptr(), self.len() as u256) = byte
             self.set_len(self.len() + 1)
         }
     }

@@ -25,7 +25,7 @@ use core::ptr::MemSpan
 /// `server.port` of a TOML document, or 0.
 fn port(_ source: MemSpan) -> i64 {
     let doc = lutz::parse(source, 0, source.len().downcast_unchecked())
-    let mut port: i64 = 0
+    var port: i64 = 0
     if doc.ok() {
         let node = entry(doc, entry(doc, doc.root(), "server"), "port")
         if node != lutz::NONE && doc.is_integer(node) {
