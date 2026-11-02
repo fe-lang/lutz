@@ -45,10 +45,10 @@ fn entry<K: lutz::Key>(_ doc: lutz::Document, _ table: u64, _ key: K) -> u64 {
 }
 ```
 
-`parse` takes any `lutz::Source`: a `core::ptr::MemSpan` on any backend, or a
-native `std::native::ByteBuffer`. Functions that produce text (`push_error`,
-`push_key`, `push_string`, `push_integer`) append to any `lutz::Sink`: a
-`core::ptr::MemBuffer` or a `ByteBuffer`.
+`parse` takes any `lutz::Source`, such as a `core::ptr::MemSpan` or a
+`core::ptr::MemBuffer`. Functions that produce text (`push_error`,
+`push_key`, `push_string`, `push_integer`) append to any `lutz::Sink`, such
+as a `MemBuffer`.
 
 A document is a tree of nodes addressed by `u64` handles; `lutz::NONE` marks
 a missing node. Tables and arrays keep their entries in source order.

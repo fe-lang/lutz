@@ -23,7 +23,7 @@ const FRAME_AT: u64 = 4
 const FRAME_ARRAY: u64 = 0
 const FRAME_INLINE_TABLE: u64 = 1
 
-/// Parse `len` bytes of `source` (a `MemSpan`, a native `ByteBuffer`, or any
+/// Parse `len` bytes of `source` (a `MemSpan`, a `MemBuffer`, or any
 /// other `Source`), starting at `start`. Check `ok()` on the result.
 pub fn parse<S: Source>(_ source: S, _ start: u64, _ len: u64) -> Document {
     var doc = Document::new(len)
