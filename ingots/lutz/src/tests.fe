@@ -19,12 +19,13 @@ fn node<T: Key>(_ doc: Document, _ table: u64, _ key: T) -> u64 {
 fn value_is<T: Key>(_ doc: Document, _ node: u64, _ expected: T) -> bool {
     let span = doc.value(node)
     let bytes = expected.bytes()
-    if span.len as usize != T::SIZE {
+    let len: usize = span.len.downcast_unchecked()
+    if len != T::SIZE {
         return false
     }
     var i: u64 = 0
     while i < span.len {
-        if doc.byte_at(span.start + i) != bytes[i as usize] {
+        if doc.byte_at(span.start + i) != bytes[i.downcast_unchecked()] {
             return false
         }
         i += 1

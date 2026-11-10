@@ -149,7 +149,7 @@ impl Document {
         let nodes_base = text_base + source_len
         let keys_base = nodes_base + capacity * COLUMNS * 8
         let frames_base = keys_base + capacity * KEY_COLUMNS * 8
-        let mem = MemBuffer::alloc((frames_base + capacity * FRAME_COLUMNS * 8) as usize)
+        let mem = MemBuffer::new((frames_base + capacity * FRAME_COLUMNS * 8).downcast_unchecked())
         var doc = Self {
             mem,
             source_len,
@@ -306,11 +306,12 @@ impl Document {
         var node = self.first(table)
         while node != NONE {
             let name = self.key(node)
-            if name.len as usize == T::SIZE {
+            let len: usize = name.len.downcast_unchecked()
+            if len == T::SIZE {
                 var same = true
                 var i: u64 = 0
                 while same && i < name.len {
-                    same = self.byte(name.start + i) == bytes[i as usize]
+                    same = self.byte(name.start + i) == bytes[i.downcast_unchecked()]
                     i += 1
                 }
                 if same {
@@ -442,11 +443,11 @@ impl Document {
     }
 
     pub(ingot) fn byte(self, _ index: u64) -> u8 {
-        self.mem[index as usize]
+        self.mem[index.downcast_unchecked()]
     }
 
     pub(ingot) fn store(mut self, _ index: u64, _ value: u8) {
-        self.mem[index as usize] = value
+        self.mem[index.downcast_unchecked()] = value
     }
 
     fn read_word(self, _ at: u64) -> u64 {
@@ -578,14 +579,14 @@ pub trait Source {
 /// A byte view of linear memory, on any backend.
 impl Source for MemSpan {
     fn source_byte(self, _ index: u64) -> u8 {
-        self.byte_at(index as usize)
+        self.byte_at(index.downcast_unchecked())
     }
 }
 
 /// An owned buffer in linear memory.
 impl Source for MemBuffer {
     fn source_byte(self, _ index: u64) -> u8 {
-        self[index as usize]
+        self[index.downcast_unchecked()]
     }
 }
 
